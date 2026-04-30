@@ -5143,15 +5143,18 @@ static RValue builtin_drawRectangle(VMContext* ctx, RValue* args, MAYBE_UNUSED i
 static RValue builtin_drawRectangleColor(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) { 
     Runner* runner = (Runner*) ctx->runner;
     if (runner->renderer == nullptr) return RValue_makeUndefined();
-
+    //work on this tomorrow
     float x1 = (float) RValue_toReal(args[0]);
     float y1 = (float) RValue_toReal(args[1]);
     float x2 = (float) RValue_toReal(args[2]);
     float y2 = (float) RValue_toReal(args[3]);
-    uint32_t color = (uint32_t) RValue_toInt32(args[4]);
+    uint32_t color1 = (uint32_t) RValue_toInt32(args[4]);
+    uint32_t color2 = (uint32_t) RValue_toInt32(args[5]);
+    uint32_t color3 = (uint32_t) RValue_toInt32(args[6]);
+    uint32_t color4 = (uint32_t) RValue_toInt32(args[7]);
     bool outline = RValue_toBool(args[8]);
 
-    runner->renderer->vtable->drawRectangle(runner->renderer, x1, y1, x2, y2, color, runner->renderer->drawAlpha, outline);
+    runner->renderer->vtable->drawRectangleColor(runner->renderer, x1, y1, x2+1, y2+1, color1, color2, color3, color4, runner->renderer->drawAlpha, outline);
     return RValue_makeUndefined();
 }
 
@@ -5801,7 +5804,7 @@ static RValue builtin_gpu_set_blendmode(VMContext* ctx, RValue* args, MAYBE_UNUS
     Runner* runner = (Runner*) ctx->runner;
     if (runner->renderer != nullptr) {
         runner->renderer->vtable->gpuSetBlendmode(runner->renderer, blendModeID);
-        //fprintf(stderr, "GPU Set Blendmode ID %d\n", blendModeID);
+        //fprintf(stderr, "GPU Set Blendmode ID %d [%s]\n", blendModeID, ctx->currentCodeName);
     }
     return RValue_makeUndefined();
 }
@@ -5817,7 +5820,7 @@ static RValue builtin_gpu_set_blendmode_ext(VMContext* ctx, RValue* args, MAYBE_
     Runner* runner = (Runner*) ctx->runner;
     if (runner->renderer != nullptr) {
         runner->renderer->vtable->gpuSetBlendmodeExt(runner->renderer, src, dest);
-        //fprintf(stderr, "GPU Set Blendmode Ext IDs (%d,%d)\n", src,dest);
+        //fprintf(stderr, "GPU Set Blendmode Ext IDs (%d,%d) [%s]\n", src,dest, ctx->currentCodeName);
     }
     return RValue_makeUndefined();
 }
@@ -5843,14 +5846,43 @@ static RValue builtin_gpu_set_blendenable(VMContext* ctx, RValue* args, MAYBE_UN
 
     bool enabled = RValue_toBool(args[0]);
 
-
-    //runner->renderer->vtable->gpuSetColorWriteEnable(runner->renderer, r,g,b,a);
+    //fprintf(stderr, "GPU Set Blending %d [%s]\n", enabled, ctx->currentCodeName);
+    runner->renderer->vtable->gpuSetBlendenable(runner->renderer, enabled);
 
     return RValue_makeUndefined();
 }
 
 
 
+
+static RValue builtin_gpu_set_alphatestref(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) { 
+    Runner* runner = (Runner*) ctx->runner;
+    int32_t alpharef = (int32_t) RValue_toReal(args[0]);
+
+    if (runner->renderer == nullptr) return RValue_makeUndefined();
+
+
+    //fprintf(stderr, "GPU Set Alpha Blend Reference %d [%s]\n", alpharef, ctx->currentCodeName);
+    runner->renderer->vtable->gpuSetAlphablendref(runner->renderer, alpharef);
+
+    return RValue_makeUndefined();
+}
+
+
+
+
+
+static RValue builtin_gpu_get_blendenabled(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) { 
+    Runner* runner = (Runner*) ctx->runner;
+    if (runner->renderer == nullptr) return RValue_makeUndefined();
+
+
+
+    //fprintf(stderr, "GPU Set Blending %d [%s]\n", enabled, ctx->currentCodeName);
+    return RValue_makeBool(runner->renderer->vtable->gpuGetBlendenabled(runner->renderer));
+
+
+}
 
 
 // application_surface is surface ID -1 (sentinel); for it, return the window dimensions
@@ -5955,7 +5987,7 @@ static RValue builtin_spriteCreateFromSurface(VMContext* ctx, RValue* args, MAYB
     bool smooth = RValue_toBool(args[6]);
     int32_t xorig = RValue_toInt32(args[7]);
     int32_t yorig = RValue_toInt32(args[8]);
-
+    //fprintf(stderr,"Create Sprite From Surface Requested By [%s]\n", ctx->currentCodeName);
     int32_t result = runner->renderer->vtable->createSpriteFromSurface(runner->renderer, surfaceId, x, y, w, h, removeback, smooth, xorig, yorig);
     return RValue_makeReal((GMLReal) result);
 }
@@ -6051,6 +6083,10 @@ static RValue builtinMakeColorHsv(MAYBE_UNUSED VMContext* ctx, RValue* args, int
     GMLReal h = RValue_toReal(args[0]) / 255.0 * 360.0;
     GMLReal s = RValue_toReal(args[1]) / 255.0;
     GMLReal v = RValue_toReal(args[2]) / 255.0;
+
+    if (s > 1.0) {
+        s = 1.0;
+    }
 
     GMLReal c = v * s;
     GMLReal x = c * (1.0 - GMLReal_fabs(GMLReal_fmod(h / 60.0, 2.0) - 1.0));
@@ -8482,12 +8518,16 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "draw_get_alpha", builtin_draw_get_alpha);
 
     //GPU
+    //Setters
     VM_registerBuiltin(ctx, "gpu_set_blendmode", builtin_gpu_set_blendmode);
     VM_registerBuiltin(ctx, "gpu_set_blendmode_ext", builtin_gpu_set_blendmode_ext);
     VM_registerBuiltin(ctx, "gpu_set_colorwriteenable", builtin_gpu_set_color_write_enable);
     VM_registerBuiltin(ctx, "gpu_set_colourwriteenable", builtin_gpu_set_color_write_enable);
     VM_registerBuiltin(ctx, "gpu_set_blendenable", builtin_gpu_set_blendenable);
-    
+    VM_registerBuiltin(ctx, "gpu_set_alphatestref", builtin_gpu_set_alphatestref);
+    //Getters
+    VM_registerBuiltin(ctx, "gpu_get_blendenable", builtin_gpu_get_blendenabled);
+
   
     // Color
     VM_registerBuiltin(ctx, "merge_color", builtinMergeColor);

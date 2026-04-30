@@ -38,27 +38,61 @@ static const char* fragmentShaderSource =
     "#version 410 core\n"
     "in vec2 vTexCoord;\n"
     "in vec4 vColor;\n"
+    "uniform float uAlphaRef;\n"
     "uniform sampler2D uTexture;\n"
     "out vec4 fragColor;\n"
     "void main() {\n"
-    "    fragColor = texture(uTexture, vTexCoord) * vColor;\n"
+    "   fragColor = texture(uTexture, vTexCoord) * vColor;\n"
+    "   if (fragColor.a < uAlphaRef)\n"
+    "       discard;\n"
     "}\n";
 
 // ===[ Blend Factors ]===
-static const GLenum BlendModeFactors[11] =
+static const GLenum BlendModeFactors[12] =
     {
-        [0] = GL_ZERO, //bm_zero
-        [1] = GL_ONE, //bm_one
-        [2] = GL_SRC_COLOR, //bm_src_colour
-        [3] = GL_ONE_MINUS_SRC_COLOR, //bm_inv_src_colour
-        [4] = GL_SRC_ALPHA, //bm_src_alpha
-        [5] = GL_ONE_MINUS_SRC_ALPHA, //bm_inv_src_alpha
-        [6] = GL_DST_ALPHA, //bm_dest_alpha
-        [7] = GL_ONE_MINUS_SRC_ALPHA, //bm_inv_dest_alpha
-        [8] = GL_DST_COLOR, //bm_dest_colour
-        [9] = GL_ONE_MINUS_DST_COLOR, //bm_inv_dest_colour
-        [10] = GL_SRC_ALPHA_SATURATE, //bm_src_alpha_sat
+        [0] = GL_ZERO, //Not Used???? It starts at 1????
+        [1] = GL_ZERO,                  //bm_zero
+        [2] = GL_ONE,                   //bm_one
+        [3] = GL_SRC_COLOR,             //bm_src_colour
+        [4] = GL_ONE_MINUS_SRC_COLOR,   //bm_inv_src_colour
+        [5] = GL_SRC_ALPHA,             //bm_src_alpha
+        [6] = GL_ONE_MINUS_SRC_ALPHA,   //bm_inv_src_alpha
+        [7] = GL_DST_ALPHA,             //bm_dest_alpha
+        [8] = GL_ONE_MINUS_DST_ALPHA,   //bm_inv_dest_alpha
+        [9] = GL_DST_COLOR,             //bm_dest_colour
+        [10] = GL_ONE_MINUS_DST_COLOR,  //bm_inv_dest_colour
+        [11] = GL_SRC_ALPHA_SATURATE,   //bm_src_alpha_sat
     };
+
+
+static const GLenum BlendModeEquations[6] =
+    {
+        [0] = GL_FUNC_ADD, //Not Used???? It starts at 1????
+        [1] = GL_FUNC_ADD, //bm_eq_add
+        [2] = GL_MAX, //bm_eq_max
+        [3] = GL_FUNC_SUBTRACT, //bm_eq_subtract
+        [4] = GL_MIN, //bm_eq_min
+        [5] = GL_FUNC_REVERSE_SUBTRACT, //bm_eq_reverse_subtract
+    };
+
+
+#define bm_zero 1
+#define bm_one 2
+#define bm_src_colour 3
+#define bm_inv_src_colour 4
+#define bm_src_alpha 5
+#define bm_inv_src_alpha 6
+#define bm_dest_alpha 7
+#define bm_inv_dest_alpha 8
+#define bm_dest_colour 9
+#define bm_inv_dest_colour 10
+#define bm_src_alpha_sat 11
+
+#define bm_eq_add 1
+#define bm_eq_max 2
+#define bm_eq_subtract 3
+#define bm_eq_min 4
+#define bm_eq_reverse_subtract 5
 
 
 // ===[ Shader Compilation ]===
@@ -132,6 +166,8 @@ static void glInit(Renderer* renderer, DataWin* dataWin) {
 
     gl->uProjection = glGetUniformLocation(gl->shaderProgram, "uProjection");
     gl->uTexture = glGetUniformLocation(gl->shaderProgram, "uTexture");
+    gl->uAlphaRef = glGetUniformLocation(gl->shaderProgram, "uAlphaRef");
+    glUniform1f(gl->uAlphaRef, 0.0f);
 
     // Create VAO/VBO/EBO
     glGenVertexArrays(1, &gl->vao);
@@ -676,6 +712,68 @@ static void glDrawRectangle(Renderer* renderer, float x1, float y1, float x2, fl
         emitColoredQuad(gl, x1, y1, x2 + 1, y2 + 1, r, g, b, alpha);
     }
 }
+
+
+static void glDrawRectangleColor(Renderer* renderer, float x1, float y1, float x2, float y2, uint32_t color1, uint32_t color2, uint32_t color3, uint32_t color4, float alpha, bool outline) {
+    GLRenderer* gl = (GLRenderer*) renderer;
+
+    float r1 = (float) BGR_R(color1) / 255.0f;
+    float g1 = (float) BGR_G(color1) / 255.0f;
+    float b1 = (float) BGR_B(color1) / 255.0f;
+
+    float r2 = (float) BGR_R(color2) / 255.0f;
+    float g2 = (float) BGR_G(color2) / 255.0f;
+    float b2 = (float) BGR_B(color2) / 255.0f;
+
+    float r3 = (float) BGR_R(color3) / 255.0f;
+    float g3 = (float) BGR_G(color3) / 255.0f;
+    float b3 = (float) BGR_B(color3) / 255.0f;
+
+    float r4 = (float) BGR_R(color4) / 255.0f;
+    float g4 = (float) BGR_G(color4) / 255.0f;
+    float b4 = (float) BGR_B(color4) / 255.0f;
+   
+
+    if (gl->quadCount > 0 && gl->currentTextureId != gl->whiteTexture) {
+        flushBatch(gl);
+    }
+    if (gl->quadCount >= MAX_QUADS) {
+        flushBatch(gl);
+    }
+    gl->currentTextureId = gl->whiteTexture;
+
+    if (outline) {
+        // Draw 4 one-pixel-wide edges: top, bottom, left, right
+
+    } else {
+        // Filled rectangle: GML adds +1 to width/height for filled rects
+
+    float* verts = gl->vertexData + gl->quadCount * VERTICES_PER_QUAD * FLOATS_PER_VERTEX;
+
+    // All UVs point to (0.5, 0.5) center of the 1x1 white texture
+    // Vertex 0: top-left
+    verts[0] = x1; verts[1] = y1; verts[2] = 0.5f; verts[3] = 0.5f;
+    verts[4] = r1;  verts[5] = g1;  verts[6] = b1;    verts[7] = alpha;
+
+    // Vertex 1: top-right
+    verts[8]  = x2; verts[9]  = y1; verts[10] = 0.5f; verts[11] = 0.5f;
+    verts[12] = r2;  verts[13] = g2;  verts[14] = b2;    verts[15] = alpha;
+
+    // Vertex 2: bottom-right
+    verts[16] = x2; verts[17] = y2; verts[18] = 0.5f; verts[19] = 0.5f;
+    verts[20] = r3;  verts[21] = g3;  verts[22] = b3;    verts[23] = alpha;
+
+    // Vertex 3: bottom-left
+    verts[24] = x1; verts[25] = y2; verts[26] = 0.5f; verts[27] = 0.5f;
+    verts[28] = r4;  verts[29] = g4;  verts[30] = b4;    verts[31] = alpha;
+
+    gl->quadCount++;
+
+    }
+}
+
+
+
 
 // ===[ Line Drawing ]===
 
@@ -1515,13 +1613,43 @@ static bool glSurfaceExists(Renderer* renderer, int32_t surfaceId) {
 
 
 
+static int32_t findSurfaceStackSlot(GLRenderer* gl) {
+    for (int32_t i = 0; 16 > i; i++) {
+        if (gl->surfaceStack[i] == -1) return i;
+    }
 
-static bool glSetSurfaceTarget(Renderer* renderer, int32_t surfaceId) {
+    return -1;
+}
+
+
+
+static void removeSurfaceStackSlot(GLRenderer* gl) {
+    for (int32_t i = 15; i >= 0; i--) {
+        if (gl->surfaceStack[i] != -1) {
+            gl->surfaceStack[i] = -1;
+            //fprintf(stderr, "Freed Surface Slot %u\n", i);
+            return;
+        }
+    }
+    
+
+}
+
+
+static int32_t findSurfaceStackTop(GLRenderer* gl) {
+    for (int32_t i = 15; i >= 0; i--) {
+        if (gl->surfaceStack[i] != -1) return i;
+    }
+
+    return -1;
+}
+
+
+static bool glSetRenderTarget(Renderer* renderer, int32_t surfaceId) {
     GLRenderer* gl = (GLRenderer*) renderer;
 
     flushBatch(gl);
 
-    //fprintf(stderr, "Set Surface Target %u\n", surfaceId);
     if (surfaceId > -1) {
         if (surfaceId < gl->ssurfaceCount)
         {
@@ -1543,7 +1671,39 @@ static bool glSetSurfaceTarget(Renderer* renderer, int32_t surfaceId) {
                 return true;
             }
         }
+    } 
+    if (surfaceId == -1) {
+
+        glUniformMatrix4fv(gl->uProjection, 1, GL_FALSE, renderer->PreviousViewMatrix.m);
+        glBindFramebuffer(GL_FRAMEBUFFER, gl->fbo);
+        glViewport(0, 0, gl->fboWidth, gl->fboHeight);
+        return true;
     }
+
+    return false;
+}
+
+
+
+static bool glSetSurfaceTarget(Renderer* renderer, int32_t surfaceId) {
+    GLRenderer* gl = (GLRenderer*) renderer;
+    
+    flushBatch(gl);
+    int32_t slot = findSurfaceStackSlot(gl);
+
+    
+    if (slot != -1) {
+        //fprintf(stderr, "Pushed Into Surface Slot %u\n", slot);
+        gl->surfaceStack[slot] = surfaceId;
+        glSetRenderTarget(renderer, gl->surfaceStack[slot]);
+        return true;
+    }  else {
+        return false;
+    }
+
+    //This has to be made into a stack surfaceStack
+    //fprintf(stderr, "Set Surface Target %u\n", surfaceId);
+
 
     return false;
 }
@@ -1556,11 +1716,16 @@ static bool glResetSurfaceTarget(Renderer* renderer) {
     GLRenderer* gl = (GLRenderer*) renderer;
 
     flushBatch(gl);
+    removeSurfaceStackSlot(gl);
+    int32_t Top = findSurfaceStackTop(gl);
+    if (Top != -1) {
+    
+    glSetRenderTarget(renderer,gl->surfaceStack[Top]);
+    } else {
+     glSetRenderTarget(renderer,-1);       
+    }
 
 
-    glUniformMatrix4fv(gl->uProjection, 1, GL_FALSE, renderer->PreviousViewMatrix.m);
-    glBindFramebuffer(GL_FRAMEBUFFER, gl->fbo);
-    glViewport(0, 0, gl->fboWidth, gl->fboHeight);
 
     return true;
 }
@@ -1644,12 +1809,6 @@ static void glDrawSurface(Renderer* renderer, int32_t surfaceID, float x, float 
 
     //what a mess I think!
 
-    //glSetSurfaceTarget(renderer, surfaceID);
-    //float u0 = (float) 0.0;
-    //float v0 = (float) 0.0;
-    //float u1 = (float) texW / (float) GL_RENDERBUFFER_WIDTH;
-    //float v1 = (float) texH / (float) GL_RENDERBUFFER_HEIGHT;
-    //glResetSurfaceTarget(renderer);
 
     float u0 = (float) 0.0;
     float v0 = (float) 1.0;
@@ -1740,14 +1899,7 @@ static void glDrawSurfacePart(Renderer* renderer, int32_t surfaceID, int32_t x, 
         flushBatch(gl);
     }
 
-    //what a mess I think!
-    //gl->currentTextureId = gl->surfaceTexture[surfaceID];
-    //glSetSurfaceTarget(renderer, surfaceID);
-    //float u0 = (float) 0.0;
-    //float v0 = (float) 0.0;
-    //float u1 = (float) texW / (float) GL_RENDERBUFFER_WIDTH;
-    //float v1 = (float) texH / (float) GL_RENDERBUFFER_HEIGHT;
-    //glResetSurfaceTarget(renderer);
+
 
     float u0 = (float) left / (float) texW;
     float v0 = (float) (float) texH - (top / (float) texH);
@@ -1815,40 +1967,52 @@ static void glSetBlendModeBasic(Renderer* renderer, int32_t BlendMode) {
     
     GLRenderer* gl = (GLRenderer*) renderer;
     flushBatch(gl);
-    glEnable(GL_BLEND);
+    //glEnable(GL_BLEND);
 
     switch (BlendMode) {
-        case 0:
-            glBlendFunc(BlendModeFactors[4], BlendModeFactors[5]);
-            //glBlendEquation(GL_FUNC_ADD);
-            //fprintf(stderr, "GPU Set Blendmode bm_normal\n");
+        case 0: //bm_normal
+            glBlendFunc(BlendModeFactors[bm_src_alpha], BlendModeFactors[bm_inv_src_alpha]);
+            glBlendEquation(BlendModeEquations[bm_eq_add]);
+
             break;
-        case 1:
-            glBlendFunc(BlendModeFactors[4], BlendModeFactors[1]);
-            //glBlendEquation(GL_FUNC_ADD);
-            //fprintf(stderr, "GPU Set Blendmode bm_add\n");
+        case 1: //bm_add
+            glBlendFunc(BlendModeFactors[bm_src_alpha], BlendModeFactors[bm_one]);
+            glBlendEquation(BlendModeEquations[bm_eq_add]);
+
             break;
-        case 2:
-            glBlendFunc(BlendModeFactors[0], BlendModeFactors[3]);
-            //glBlendEquation(GL_FUNC_SUBTRACT);
-            //fprintf(stderr, "GPU Set Blendmode bm_subtract\n");
+        case 2: //bm_max
+            glBlendFunc(BlendModeFactors[bm_src_alpha], BlendModeFactors[bm_inv_src_colour]);
+            glBlendEquation(BlendModeEquations[bm_eq_add]);
+
             break;
-        case 3:
-            glBlendFunc(BlendModeFactors[4], BlendModeFactors[3]);
+        case 3: //bm_subtract
+            glBlendFunc(BlendModeFactors[bm_zero], BlendModeFactors[bm_inv_src_colour]);
+            glBlendEquation(BlendModeEquations[bm_eq_add]);
+
+            break;
+        case 4: //bm_min
+            //glBlendFunc(BlendModeFactors[], BlendModeFactors[]);
             //glBlendEquation(GL_MAX);
-            //fprintf(stderr, "GPU Set Blendmode bm_max\n");
+            //glBlendEquation(GL_FUNC_SUBTRACT);
+
             break;
+        case 5: //bm_reverse_subtract
+            //glBlendFunc(BlendModeFactors[], BlendModeFactors[]);
+            //glBlendEquation(GL_MAX);
+            //glBlendEquation(GL_FUNC_SUBTRACT);
+
+            break;
+
+
     }    
 }
-
-
 
 
 static void glSetBlendModeExt(Renderer* renderer, int32_t src, int32_t dest) {
     
     GLRenderer* gl = (GLRenderer*) renderer;
     flushBatch(gl);
-    glEnable(GL_BLEND);
+    //glEnable(GL_BLEND);
     glBlendFunc(BlendModeFactors[src],BlendModeFactors[dest]);
 }
 
@@ -1875,6 +2039,24 @@ static void glSetBlendEnable(Renderer* renderer, bool enabled) {
     //glEnable(GL_BLEND);
     //glBlendFunc(BlendModeFactors[src],BlendModeFactors[dest]);
 }
+
+static bool glGetBlendEnabled(Renderer* renderer) {
+    
+    return glIsEnabled(GL_BLEND);
+}
+
+
+static void glSetBlendAlphaRef(Renderer* renderer, int32_t alpharef) {
+
+    GLRenderer* gl = (GLRenderer*) renderer;
+    flushBatch(gl);
+    float alpha = (float) alpharef / 255.0f;
+    gl->base.alphaCutRef = alpha;
+    glUniform1f(gl->uAlphaRef, alpha);
+}
+
+
+
 
 static int32_t glCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID, int32_t x, int32_t y, int32_t w, int32_t h, bool removeback, bool smooth, int32_t xorig, int32_t yorig) {
     GLRenderer* gl = (GLRenderer*) renderer;
@@ -1927,8 +2109,8 @@ static int32_t glCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID, 
     glGenTextures(1, &newTexId);
     glBindTexture(GL_TEXTURE_2D, newTexId);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, smooth ? GL_LINEAR : GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, smooth ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
@@ -2027,6 +2209,7 @@ static RendererVtable glVtable = {
     .drawSpritePos = glDrawSpritePos,
     .drawSpritePart = glDrawSpritePart,
     .drawRectangle = glDrawRectangle,
+    .drawRectangleColor = glDrawRectangleColor,
     .drawLine = glDrawLine,
     .drawLineColor = glDrawLineColor,
     .drawTriangle = glDrawTriangle,
@@ -2053,6 +2236,8 @@ static RendererVtable glVtable = {
     .gpuSetBlendmodeExt = glSetBlendModeExt,
     .gpuSetColorWriteEnable = glSetColorWriteEnable,
     .gpuSetBlendenable = glSetBlendEnable,
+    .gpuGetBlendenabled = glGetBlendEnabled,
+    .gpuSetAlphablendref = glSetBlendAlphaRef,
 };
 
 // ===[ Public API ]===
@@ -2066,5 +2251,22 @@ Renderer* GLRenderer_create(void) {
     gl->base.drawFont = -1;
     gl->base.drawHalign = 0;
     gl->base.drawValign = 0;
+    gl->base.alphaCutRef = 0.0;
+    gl->surfaceStack[0] = -1;
+    gl->surfaceStack[1] = -1;
+    gl->surfaceStack[2] = -1;
+    gl->surfaceStack[3] = -1;
+    gl->surfaceStack[4] = -1;
+    gl->surfaceStack[5] = -1;
+    gl->surfaceStack[6] = -1;
+    gl->surfaceStack[7] = -1;   
+    gl->surfaceStack[8] = -1;
+    gl->surfaceStack[9] = -1;
+    gl->surfaceStack[10] = -1;
+    gl->surfaceStack[11] = -1;
+    gl->surfaceStack[12] = -1;
+    gl->surfaceStack[13] = -1;
+    gl->surfaceStack[14] = -1;
+    gl->surfaceStack[15] = -1;
     return (Renderer*) gl;
 }

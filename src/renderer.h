@@ -27,6 +27,7 @@ typedef struct {
     void (*drawCircle)(Renderer* renderer, float x, float y, float radius, bool outline);
     void (*drawCircleColor)(Renderer* renderer, float x, float y, float radius, uint32_t color1, uint32_t color2, bool outline);
     void (*drawRectangle)(Renderer* renderer, float x1, float y1, float x2, float y2, uint32_t color, float alpha, bool outline);
+    void (*drawRectangleColor)(Renderer* renderer, float x1, float y1, float x2, float y2, uint32_t color1, uint32_t color2, uint32_t color3, uint32_t color4, float alpha, bool outline);
     void (*drawLine)(Renderer* renderer, float x1, float y1, float x2, float y2, float width, uint32_t color, float alpha);
     void (*drawTriangle)(Renderer *renderer, float x1, float y1, float x2, float y2, float x3, float y3, bool outline);
     void (*drawLineColor)(Renderer* renderer, float x1, float y1, float x2, float y2, float width, uint32_t color1, uint32_t color2, float alpha);
@@ -58,6 +59,8 @@ typedef struct {
     void (*gpuSetBlendmodeExt)(Renderer* renderer, int32_t src, int32_t dest);
     void (*gpuSetColorWriteEnable)(Renderer* renderer, bool r, bool g, bool b, bool a);
     void (*gpuSetBlendenable)(Renderer* renderer, bool enabled);
+    void (*gpuSetAlphablendref)(Renderer* renderer, int32_t alpharef);
+    bool (*gpuGetBlendenabled)(Renderer* renderer); 
 } RendererVtable; //gpu_set_colorwriteenable
 
 // ===[ Renderer Base Struct ]===
@@ -67,6 +70,7 @@ struct Renderer {
     DataWin* dataWin;
     uint32_t drawColor;  // BGR format, default 0xFFFFFF (white)
     float drawAlpha;     // default 1.0
+    float alphaCutRef;   // I Will Asssume Default of 0.0
     int32_t circlePrecision; // default is 24 I think
     int32_t drawFont;    // default -1 (no font)
     int32_t drawHalign;  // 0=left, 1=center, 2=right

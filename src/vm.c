@@ -1526,7 +1526,7 @@ static void handleMul(VMContext* ctx, uint32_t instr) {
 static void handleDiv(VMContext* ctx, uint32_t instr) {
     RValue b = stackPop(ctx);
     RValue a = stackPop(ctx);
-    GMLReal divisor = RValue_toReal(b);
+    GMLReal divisor = RValue_toReal(b);   
     if (divisor == 0.0) {
         fprintf(stderr, "VM: DoDiv :: Divide by zero\n");
         abort();

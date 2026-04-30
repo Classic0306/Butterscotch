@@ -17,6 +17,7 @@ typedef struct {
     GLuint shaderProgram;
     GLint uProjection;
     GLint uTexture;
+    GLint uAlphaRef;
 
     //Matrix4f previousViewMatix;
 
@@ -57,7 +58,8 @@ typedef struct {
     int32_t* surfaceHeight;
     uint32_t ssurfaceCount;
 
-
+    int32_t surfaceStack[16];
+    //YoYoSurface surfaces[16];
 
 
 } GLRenderer;
