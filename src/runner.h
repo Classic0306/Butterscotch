@@ -335,13 +335,14 @@ typedef struct Runner {
     bool debugMode;
     void* nativeWindow;
     void (*setWindowTitle)(void* window, const char* title);
+    bool (*windowHasFocus)(void* window);
     TileLayerMapEntry* tileLayerMap; // stb_ds hashmap: depth -> tile layer state
     RuntimeLayer* runtimeLayers; // stb_ds array, index-parallel to currentRoom->layers for parsed entries; dynamic entries appended
     uint32_t nextLayerId;        // counter for IDs of layers/elements created at runtime
     SavedRoomState* savedRoomStates; // array of size dataWin->room.count, for persistent room support
     int32_t viewCurrent; // index of the view currently being drawn (for view_current)
     struct { char* key; int value; }* disabledObjects; // stb_ds string hashmap, nullptr = no filtering
-    struct { int key; Instance* value; }* instancesToId;
+    struct { int key; Instance* value; }* instancesById;
     bool forceDrawDepth;
     // Depth-sorted unified list of all drawables (instances + tiles + runtime layers) for the current room.
     // Active/visible filtering happens at draw time, so toggling those flags does not invalidate the cache.
@@ -399,6 +400,9 @@ typedef struct Runner {
     // GUI layer size (display_set_gui_size). 0 = auto-match the current view's port size.
     int32_t guiWidth;
     int32_t guiHeight;
+
+    // GMS legacy (pre 2022.1) collision behavior: AABB overlap treats touching edges as overlap.
+    bool collisionCompatibilityMode;
 } Runner;
 
 const char* Runner_getEventName(int32_t eventType, int32_t eventSubtype);

@@ -461,14 +461,14 @@ RValue VMBuiltins_getVariable(VMContext* ctx, int16_t builtinVarId, const char* 
         case BUILTIN_VAR_SPRITE_XOFFSET: {
             if (inst == nullptr) break;
             if (inst->spriteIndex >= 0 && runner->dataWin->sprt.count > (uint32_t) inst->spriteIndex) {
-                return RValue_makeReal((GMLReal) runner->dataWin->sprt.sprites[inst->spriteIndex].originX);
+                return RValue_makeReal((GMLReal) runner->dataWin->sprt.sprites[inst->spriteIndex].originX * inst->imageXscale);
             }
             return RValue_makeReal(0.0);
         }
         case BUILTIN_VAR_SPRITE_YOFFSET: {
             if (inst == nullptr) break;
             if (inst->spriteIndex >= 0 && runner->dataWin->sprt.count > (uint32_t) inst->spriteIndex) {
-                return RValue_makeReal((GMLReal) runner->dataWin->sprt.sprites[inst->spriteIndex].originY);
+                return RValue_makeReal((GMLReal) runner->dataWin->sprt.sprites[inst->spriteIndex].originY * inst->imageYscale);
             }
             return RValue_makeReal(0.0);
         }
@@ -705,7 +705,7 @@ RValue VMBuiltins_getVariable(VMContext* ctx, int16_t builtinVarId, const char* 
         case BUILTIN_VAR_ARGUMENT: {
             if (ctx->scriptArgs != nullptr && ctx->scriptArgCount > arrayIndex && arrayIndex >= 0) {
                 RValue val = ctx->scriptArgs[arrayIndex];
-                val.ownsString = false;
+                val.ownsReference = false;
                 return val;
             }
             return RValue_makeUndefined();
@@ -714,7 +714,7 @@ RValue VMBuiltins_getVariable(VMContext* ctx, int16_t builtinVarId, const char* 
             int argNumber = builtinVarId - BUILTIN_VAR_ARGUMENT0;
             if (ctx->scriptArgs != nullptr && ctx->scriptArgCount > argNumber) {
                 RValue val = ctx->scriptArgs[argNumber];
-                val.ownsString = false;
+                val.ownsReference = false;
                 return val;
             }
             return RValue_makeUndefined();
@@ -1900,11 +1900,12 @@ static RValue builtinIrandomRange(MAYBE_UNUSED VMContext* ctx, RValue* args, int
 static RValue builtinChoose(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
     if (1 > argCount) return RValue_makeUndefined();
     int32_t idx = rand() % argCount;
-    // Must duplicate the value since args will be freed
+    // Steal ownership: the caller's RValue_free of args[idx] becomes a no-op, and the returned value owns the ref instead.
     RValue val = args[idx];
-    if (val.type == RVALUE_STRING && val.string != nullptr) {
+    if (val.type == RVALUE_STRING && val.string != nullptr && !val.ownsReference) {
         return RValue_makeOwnedString(safeStrdup(val.string));
     }
+    args[idx].ownsReference = false;
     return val;
 }
 
@@ -2149,9 +2150,11 @@ static RValue builtinVariableGlobalGet(VMContext* ctx, RValue* args, int32_t arg
     if (ctx->globalVarCount > (uint32_t) varID) {
         RValue val = ctx->globalVars[varID];
         // Duplicate owned strings
-        if (val.type == RVALUE_STRING && val.ownsString && val.string != nullptr) {
+        if (val.type == RVALUE_STRING && val.ownsReference && val.string != nullptr) {
             return RValue_makeOwnedString(safeStrdup(val.string));
         }
+        // Return a weak view: the global slot retains ownership. The caller's Pop will incRef into the destination slot.
+        val.ownsReference = false;
         return val;
     }
     return RValue_makeUndefined();
@@ -2165,13 +2168,7 @@ static RValue builtinVariableGlobalSet(VMContext* ctx, RValue* args, int32_t arg
     int32_t varID = ctx->globalVarNameMap[idx].value;
     if (ctx->globalVarCount > (uint32_t) varID) {
         RValue_free(&ctx->globalVars[varID]);
-        RValue val = args[1];
-        // Duplicate owned strings since args will be freed
-        if (val.type == RVALUE_STRING && val.string != nullptr) {
-            ctx->globalVars[varID] = RValue_makeOwnedString(safeStrdup(val.string));
-        } else {
-            ctx->globalVars[varID] = val;
-        }
+        ctx->globalVars[varID] = RValue_makeIndependent(args[1]);
     }
     return RValue_makeUndefined();
 }
@@ -2204,7 +2201,7 @@ static RValue variableInstanceGetOn(VMContext* ctx, Instance* target, const char
         RValue val = VMBuiltins_getVariable(ctx, builtinId, name, -1);
         ctx->currentInstance = saved;
         // Duplicate string so caller-owned args cleanup does not affect it
-        if (val.type == RVALUE_STRING && val.string != nullptr && !val.ownsString) {
+        if (val.type == RVALUE_STRING && val.string != nullptr && !val.ownsReference) {
             return RValue_makeOwnedString(safeStrdup(val.string));
         }
         return val;
@@ -2226,7 +2223,7 @@ static RValue builtinVariableInstanceGet(VMContext* ctx, RValue* args, int32_t a
     Runner* runner = (Runner*) ctx->runner;
 
     if (id >= 100000) {
-        Instance* inst = hmget(runner->instancesToId, id);
+        Instance* inst = hmget(runner->instancesById, id);
         if (inst != nullptr && inst->active) return variableInstanceGetOn(ctx, inst, name);
         return RValue_makeUndefined();
     }
@@ -2255,7 +2252,7 @@ static RValue builtinVariableInstanceSet(VMContext* ctx, RValue* args, int32_t a
 
     if (id >= 100000) {
         // Specific instance ID
-        Instance* inst = hmget(runner->instancesToId, id);
+        Instance* inst = hmget(runner->instancesById, id);
         if (inst != nullptr && inst->active) variableInstanceSetOn(ctx, inst, name, val);
         return RValue_makeUndefined();
     }
@@ -2286,7 +2283,7 @@ static RValue builtinVariableInstanceExists(VMContext* ctx, RValue* args, int32_
     Runner* runner = (Runner*) ctx->runner;
 
     if (id >= 100000) {
-        Instance* inst = hmget(runner->instancesToId, id);
+        Instance* inst = hmget(runner->instancesById, id);
         if (inst != nullptr && inst->active) return RValue_makeBool(variableInstanceExistsOn(ctx, inst, name));
         return RValue_makeBool(false);
     }
@@ -2318,9 +2315,9 @@ static RValue builtinMethod(VMContext* ctx, MAYBE_UNUSED RValue* args, int32_t a
     if (rawArg >= 0 && (uint32_t) rawArg < ctx->dataWin->func.functionCount) {
         const char* funcName = ctx->dataWin->func.functions[rawArg].name;
         if (funcName != nullptr) {
-            ptrdiff_t idx = shgeti(ctx->funcMap, (char*) funcName);
+            ptrdiff_t idx = shgeti(ctx->codeIndexByName, (char*) funcName);
             if (idx >= 0) {
-                codeIndex = ctx->funcMap[idx].value;
+                codeIndex = ctx->codeIndexByName[idx].value;
             }
         }
     }
@@ -2357,9 +2354,17 @@ static RValue builtinScriptExecute(VMContext* ctx, RValue* args, int32_t argCoun
         if (IS_BC17_OR_HIGHER(ctx) && rawArg >= 0 && ctx->dataWin->func.functionCount > (uint32_t) rawArg) {
             const char* funcName = ctx->dataWin->func.functions[rawArg].name;
             if (funcName != nullptr) {
-                ptrdiff_t idx = shgeti(ctx->funcMap, (char*) funcName);
+                ptrdiff_t idx = shgeti(ctx->codeIndexByName, (char*) funcName);
                 if (idx >= 0) {
-                    codeId = ctx->funcMap[idx].value;
+                    codeId = ctx->codeIndexByName[idx].value;
+                } else {
+                    // Not a user script - might be a builtin function reference
+                    ptrdiff_t bidx = shgeti(ctx->builtinMap, (char*) funcName);
+                    if (bidx >= 0) {
+                        BuiltinFunc bf = ctx->builtinMap[bidx].value;
+                        RValue* scriptArgs = (argCount > 1) ? &args[1] : nullptr;
+                        return bf(ctx, scriptArgs, argCount - 1);
+                    }
                 }
             }
         }
@@ -2389,7 +2394,7 @@ static RValue builtinScriptExecute(VMContext* ctx, RValue* args, int32_t argCoun
 #if IS_BC17_OR_HIGHER_ENABLED
     if (args[0].type == RVALUE_METHOD && args[0].method->boundInstanceId >= 0) {
         Runner* runner = (Runner*) ctx->runner;
-        Instance* bound = hmget(runner->instancesToId, args[0].method->boundInstanceId);
+        Instance* bound = hmget(runner->instancesById, args[0].method->boundInstanceId);
         if (bound != nullptr) ctx->currentInstance = bound;
     }
 #endif
@@ -2446,12 +2451,7 @@ static RValue builtinDsMapAdd(VMContext* ctx, RValue* args, int32_t argCount) {
     if (exists) {
         free(key); // Key already exists, we didn't insert it
     } else {
-        RValue val = args[2];
-        if (val.type == RVALUE_STRING && val.string != nullptr) {
-            val = RValue_makeOwnedString(safeStrdup(val.string));
-        }
-        shput(*mapPtr, key, val);
-        // The RValue is now "owned" by the map, we do not need to free it!
+        shput(*mapPtr, key, RValue_makeIndependent(args[2]));
     }
 
     return RValue_makeUndefined();
@@ -2473,12 +2473,7 @@ static RValue builtinDsMapSet(VMContext* ctx, RValue* args, int32_t argCount) {
         RValue_free(&(*mapPtr)[existingKeyIndex].value);
     }
 
-    RValue val = args[2];
-    if (val.type == RVALUE_STRING && val.string != nullptr) {
-        val = RValue_makeOwnedString(safeStrdup(val.string));
-    }
-
-    shput(*mapPtr, key, val);
+    shput(*mapPtr, key, RValue_makeIndependent(args[2]));
 
     if (existingKeyIndex != -1) {
         // If it already existed, then shput still owns the old key
@@ -2508,6 +2503,8 @@ static RValue builtinDsMapFindValue(VMContext* ctx, RValue* args, int32_t argCou
     if (val.type == RVALUE_STRING && val.string != nullptr) {
         return RValue_makeOwnedString(safeStrdup(val.string));
     }
+    // Return a weak view: the map retains ownership. The caller's Pop will incRef into the destination slot.
+    val.ownsReference = false;
     return val;
 }
 
@@ -2583,11 +2580,7 @@ static RValue builtinDsListAdd(VMContext* ctx, RValue* args, int32_t argCount) {
     if (list == nullptr) return RValue_makeUndefined();
     // ds_list_add can take multiple values after the list id
     repeat(argCount - 1, i) {
-        RValue val = args[i + 1];
-        if (val.type == RVALUE_STRING) {
-            val = RValue_makeOwnedString(safeStrdup(val.string));
-        }
-        arrput(list->items, val);
+        arrput(list->items, RValue_makeIndependent(args[i + 1]));
     }
     return RValue_makeUndefined();
 }
@@ -2656,16 +2649,20 @@ static RValue builtinArrayPush(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_
                 *slot = RValue_makeOwnedString(safeStrdup(val.string));
             } else if (val.type == RVALUE_ARRAY && val.array != nullptr) {
                 GMLArray_incRef(val.array);
-                val.ownsString = true;
+                val.ownsReference = true;
                 *slot = val;
 #if IS_BC17_OR_HIGHER_ENABLED
             } else if (val.type == RVALUE_METHOD && val.method != nullptr) {
                 GMLMethod_incRef(val.method);
-                val.ownsString = true;
+                val.ownsReference = true;
                 *slot = val;
 #endif
+            } else if (val.type == RVALUE_STRUCT && val.structInst != nullptr) {
+                Instance_structIncRef(val.structInst);
+                val.ownsReference = true;
+                *slot = val;
             } else {
-                val.ownsString = false;
+                val.ownsReference = false;
                 *slot = val;
             }
         }
@@ -2745,7 +2742,7 @@ static RValue builtinPlaceFree(VMContext* ctx, RValue* args, int32_t argCount) {
             InstanceBBox otherBBox = Collision_computeBBox(runner->dataWin, other);
             if (!otherBBox.valid) continue;
 
-            if (Collision_instancesOverlapPrecise(runner->dataWin, caller, other, callerBBox, otherBBox)) {
+            if (Collision_instancesOverlapPrecise(runner->dataWin, runner->collisionCompatibilityMode, caller, other, callerBBox, otherBBox)) {
                 free = false;
                 break;
             }
@@ -2778,7 +2775,7 @@ static bool placeEmptyAt(Runner* runner, Instance* caller, GMLReal testX, GMLRea
             InstanceBBox otherBBox = Collision_computeBBox(runner->dataWin, other);
             if (!otherBBox.valid) continue;
 
-            if (Collision_instancesOverlapPrecise(runner->dataWin, caller, other, callerBBox, otherBBox)) {
+            if (Collision_instancesOverlapPrecise(runner->dataWin, runner->collisionCompatibilityMode, caller, other, callerBBox, otherBBox)) {
                 empty = false;
                 break;
             }
@@ -2809,7 +2806,7 @@ static bool placeFreeAt(Runner* runner, Instance* caller, GMLReal testX, GMLReal
             InstanceBBox otherBBox = Collision_computeBBox(runner->dataWin, other);
             if (!otherBBox.valid) continue;
 
-            if (Collision_instancesOverlapPrecise(runner->dataWin, caller, other, callerBBox, otherBBox)) {
+            if (Collision_instancesOverlapPrecise(runner->dataWin, runner->collisionCompatibilityMode, caller, other, callerBBox, otherBBox)) {
                 free = false;
                 break;
             }
@@ -2841,7 +2838,7 @@ static bool noCollisionWithObject(Runner* runner, Instance* caller, GMLReal test
             InstanceBBox otherBBox = Collision_computeBBox(runner->dataWin, other);
             if (!otherBBox.valid) continue;
 
-            if (Collision_instancesOverlapPrecise(runner->dataWin, caller, other, callerBBox, otherBBox)) {
+            if (Collision_instancesOverlapPrecise(runner->dataWin, runner->collisionCompatibilityMode, caller, other, callerBBox, otherBBox)) {
                 free = false;
                 break;
             }
@@ -4070,6 +4067,20 @@ static RValue builtinWindowSetCaption(VMContext* ctx, MAYBE_UNUSED RValue* args,
     return RValue_makeUndefined();
 }
 
+static RValue builtinWindowHasFocus(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Runner* runner = (Runner*) ctx->runner;
+    // Always return true when not on GLFW
+    if (runner == nullptr || runner->nativeWindow == nullptr) {
+        return RValue_makeBool(true);
+    }
+
+    if (runner->windowHasFocus) {
+        return RValue_makeBool(runner->windowHasFocus(runner->nativeWindow));
+    }
+
+    return RValue_makeBool(true);
+}
+
 // ===[ Game State Functions ]===
 static RValue builtinGameRestart(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
     ctx->runner->pendingRoom = ROOM_RESTARTGAME;
@@ -4117,6 +4128,33 @@ static RValue builtinInstanceFind(VMContext* ctx, RValue* args, int32_t argCount
     return RValue_makeReal((GMLReal) resultId);
 }
 
+static RValue builtinInstanceNearest(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (3 > argCount) return RValue_makeReal(INSTANCE_NOONE);
+    Runner* runner = (Runner*) ctx->runner;
+    GMLReal x = RValue_toReal(args[0]);
+    GMLReal y = RValue_toReal(args[1]);
+    GMLReal bestDistSq = 0.0;
+    int32_t objectIndex = RValue_toInt32(args[2]);
+    int32_t resultId = INSTANCE_NOONE;
+    int32_t snapBase = Runner_pushInstancesOfObject(runner, objectIndex);
+    int32_t snapEnd  = (int32_t) arrlen(runner->instanceSnapshots);
+    for (int32_t i = snapBase; snapEnd > i; i++) {
+        Instance* inst = runner->instanceSnapshots[i];
+        if (!inst->active) continue;
+
+        GMLReal dx = inst->x - x;
+        GMLReal dy = inst->y - y;
+        GMLReal distSq = dx * dx + dy * dy;
+
+        if (resultId == INSTANCE_NOONE || distSq < bestDistSq) {
+            resultId = inst->instanceId;
+            bestDistSq = distSq;
+        }
+    }
+    Runner_popInstanceSnapshot(runner, snapBase);
+    return RValue_makeReal((GMLReal) resultId);
+}
+
 static RValue builtinInstanceExists(VMContext* ctx, RValue* args, int32_t argCount) {
     if (1 > argCount) return RValue_makeBool(false);
     Runner* runner = (Runner*) ctx->runner;
@@ -4131,7 +4169,7 @@ static RValue builtinInstanceExists(VMContext* ctx, RValue* args, int32_t argCou
         Runner_popInstanceSnapshot(runner, snapBase);
     } else {
         // Instance ID: search for a specific instance
-        Instance* inst = hmget(runner->instancesToId, id);
+        Instance* inst = hmget(runner->instancesById, id);
         found = (inst != nullptr && inst->active);
     }
     return RValue_makeBool(found);
@@ -4157,7 +4195,7 @@ static RValue builtinInstanceDestroy(VMContext* ctx, RValue* args, int32_t argCo
         }
         Runner_popInstanceSnapshot(runner, snapBase);
     } else {
-        Instance* inst = hmget(runner->instancesToId, id);
+        Instance* inst = hmget(runner->instancesById, id);
         if (inst != nullptr && inst->active) Runner_destroyInstance(runner, inst);
     }
     return RValue_makeUndefined();
@@ -5097,7 +5135,7 @@ static RValue builtin_drawSpritePartExt(VMContext* ctx, RValue* args, MAYBE_UNUS
         subimg = (int32_t) ((Instance*) ctx->currentInstance)->imageIndex;
     }
 
-    Renderer_drawSpritePartExt(runner->renderer, spriteIndex, subimg, left, top, width, height, x, y, xscale, yscale, color, alpha);
+    Renderer_drawSpritePartExt(runner->renderer, spriteIndex, subimg, left, top, width, height, x, y, xscale, yscale, 0.0f, 0.0f, 0.0f, color, alpha);
     return RValue_makeUndefined();
 }
 
@@ -5357,7 +5395,27 @@ static RValue builtin_drawTextExt(VMContext* ctx, RValue* args, MAYBE_UNUSED int
     return RValue_makeUndefined();
 }
 
-STUB_RETURN_UNDEFINED(draw_text_ext_transformed)
+static RValue builtin_drawTextExtTransformed(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    logSemiStubbedFunction(ctx, "draw_text_ext_transformed");
+
+    Runner* runner = (Runner*) ctx->runner;
+    if (runner->renderer == nullptr) return RValue_makeUndefined();
+
+    float x = (float) RValue_toReal(args[0]);
+    float y = (float) RValue_toReal(args[1]);
+    char* str = RValue_toString(args[2]);
+    int32_t separation = RValue_toInt32(args[3]);
+    int32_t width = RValue_toInt32(args[4]);
+    float xscale = (float) RValue_toReal(args[5]);
+    float yscale = (float) RValue_toReal(args[6]);
+    float angle = (float) RValue_toReal(args[7]);
+
+    PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
+    runner->renderer->vtable->drawText(runner->renderer, processedText.text, x, y, xscale, yscale, angle);
+    PreprocessedText_free(processedText);
+    free(str);
+    return RValue_makeUndefined();
+}
 
 static RValue builtin_drawTextColor(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
     Runner* runner = (Runner*) ctx->runner;
@@ -5401,8 +5459,53 @@ static RValue builtin_drawTextColorTransformed(VMContext* ctx, RValue* args, MAY
     free(str);
     return RValue_makeUndefined();
 }
-STUB_RETURN_UNDEFINED(draw_text_color_ext)
-STUB_RETURN_UNDEFINED(draw_text_color_ext_transformed)
+
+static RValue builtin_drawTextColorExt(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    logSemiStubbedFunction(ctx, "draw_text_color_ext");
+
+    Runner* runner = (Runner*) ctx->runner;
+    if (runner->renderer == nullptr) return RValue_makeUndefined();
+
+    float x = (float) RValue_toReal(args[0]);
+    float y = (float) RValue_toReal(args[1]);
+    char* str = RValue_toString(args[2]);
+    int32_t c1 = (float) RValue_toInt32(args[5]);
+    int32_t c2 = (float) RValue_toInt32(args[6]);
+    int32_t c3 = (float) RValue_toInt32(args[7]);
+    int32_t c4 = (float) RValue_toInt32(args[8]);
+    float alpha = (float) RValue_toReal(args[9]);
+
+    PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
+    runner->renderer->vtable->drawTextColor(runner->renderer, processedText.text, x, y, 1.0f, 1.0f, 0.0f, c1, c2, c3, c4, alpha);
+    PreprocessedText_free(processedText);
+    free(str);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_drawTextColorExtTransformed(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    logSemiStubbedFunction(ctx, "draw_text_color_ext_transformed");
+
+    Runner* runner = (Runner*) ctx->runner;
+    if (runner->renderer == nullptr) return RValue_makeUndefined();
+
+    float x = (float) RValue_toReal(args[0]);
+    float y = (float) RValue_toReal(args[1]);
+    char* str = RValue_toString(args[2]);
+    float xscale = (float) RValue_toReal(args[5]);
+    float yscale = (float) RValue_toReal(args[6]);
+    float angle = (float) RValue_toReal(args[7]);
+    int32_t c1 = (float) RValue_toInt32(args[8]);
+    int32_t c2 = (float) RValue_toInt32(args[9]);
+    int32_t c3 = (float) RValue_toInt32(args[10]);
+    int32_t c4 = (float) RValue_toInt32(args[11]);
+    float alpha = (float) RValue_toReal(args[12]);
+
+    PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
+    runner->renderer->vtable->drawTextColor(runner->renderer, processedText.text, x, y, xscale, yscale, angle, c1, c2, c3, c4, alpha);
+    PreprocessedText_free(processedText);
+    free(str);
+    return RValue_makeUndefined();
+}
 
 
 
@@ -5481,7 +5584,7 @@ static RValue builtin_drawBackgroundPartExt(VMContext* ctx, RValue* args, MAYBE_
     int32_t tpagIndex = Renderer_resolveBackgroundTPAGIndex(runner->dataWin, bgIndex);
     if (0 > tpagIndex) return RValue_makeUndefined();
 
-    runner->renderer->vtable->drawSpritePart(runner->renderer, tpagIndex, left, top, width, height, x, y, xscale, yscale, color, alpha);
+    runner->renderer->vtable->drawSpritePart(runner->renderer, tpagIndex, left, top, width, height, x, y, xscale, yscale, 0.0f, 0.0f, 0.0f, color, alpha);
     return RValue_makeUndefined();
 }
 
@@ -6204,7 +6307,7 @@ static RValue builtinPlaceMeeting(VMContext* ctx, RValue* args, int32_t argCount
             for (int32_t gy = callerRange.minGridY; callerRange.maxGridY >= gy && !found; gy++) {
                 Instance** cell = runner->spatialGrid->grid[SpatialGrid_cellIndex(runner->spatialGrid, gx, gy)];
                 int32_t cellLen = (int32_t) arrlen(cell);
-                for (int32_t ci = 0; cellLen > ci; ci++) {
+                repeat(cellLen, ci) {
                     Instance* other = cell[ci];
                     if (!other->active || other == caller) continue;
                     if (other->lastCollisionQueryId == queryId) continue;
@@ -6216,7 +6319,7 @@ static RValue builtinPlaceMeeting(VMContext* ctx, RValue* args, int32_t argCount
                     InstanceBBox otherBBox = Collision_computeBBox(runner->dataWin, other);
                     if (!otherBBox.valid) continue;
 
-                    if (Collision_instancesOverlapPrecise(runner->dataWin, caller, other, callerBBox, otherBBox)) {
+                    if (Collision_instancesOverlapPrecise(runner->dataWin, runner->collisionCompatibilityMode, caller, other, callerBBox, otherBBox)) {
                         found = true;
                         break;
                     }
@@ -6560,7 +6663,7 @@ static RValue builtinInstancePlace(VMContext* ctx, RValue* args, int32_t argCoun
             for (int32_t gy = callerRange.minGridY; callerRange.maxGridY >= gy && resultId == INSTANCE_NOONE; gy++) {
                 Instance** cell = runner->spatialGrid->grid[SpatialGrid_cellIndex(runner->spatialGrid, gx, gy)];
                 int32_t cellLen = (int32_t) arrlen(cell);
-                for (int32_t ci = 0; cellLen > ci; ci++) {
+                repeat(cellLen, ci) {
                     Instance* other = cell[ci];
                     if (!other->active || other == caller) continue;
                     if (other->lastCollisionQueryId == queryId) continue;
@@ -6572,7 +6675,7 @@ static RValue builtinInstancePlace(VMContext* ctx, RValue* args, int32_t argCoun
                     InstanceBBox otherBBox = Collision_computeBBox(runner->dataWin, other);
                     if (!otherBBox.valid) continue;
 
-                    if (Collision_instancesOverlapPrecise(runner->dataWin, caller, other, callerBBox, otherBBox)) {
+                    if (Collision_instancesOverlapPrecise(runner->dataWin, runner->collisionCompatibilityMode, caller, other, callerBBox, otherBBox)) {
                         resultId = other->instanceId;
                         break;
                     }
@@ -6614,6 +6717,52 @@ static RValue builtinInstancePosition(VMContext* ctx, RValue* args, int32_t argC
     Runner_popInstanceSnapshot(runner, snapBase);
 
     return RValue_makeReal((GMLReal) resultId);
+}
+
+// position_meeting(x, y, obj) - returns true if point (x, y) is inside any instance of obj.
+static RValue builtinPositionMeeting(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (3 > argCount) return RValue_makeBool(false);
+
+    Runner* runner = (Runner*) ctx->runner;
+    GMLReal px = RValue_toReal(args[0]);
+    GMLReal py = RValue_toReal(args[1]);
+    int32_t target = RValue_toInt32(args[2]);
+
+    bool found = false;
+    bool filterByObject = target >= 0 && 100000 > target;
+    bool filterByInstanceId = target >= 100000;
+
+    SpatialGrid_syncGrid(runner, runner->spatialGrid);
+
+    SpatialGridRange range = SpatialGrid_computeCellRange(runner->spatialGrid, px, py, px, py);
+    uint32_t queryId = ++runner->collisionQueryCounter;
+
+    for (int32_t gx = range.minGridX; range.maxGridX >= gx && !found; gx++) {
+        for (int32_t gy = range.minGridY; range.maxGridY >= gy && !found; gy++) {
+            Instance** cell = runner->spatialGrid->grid[SpatialGrid_cellIndex(runner->spatialGrid, gx, gy)];
+            int32_t cellLen = (int32_t) arrlen(cell);
+            repeat(cellLen, ci) {
+                Instance* other = cell[ci];
+                // Keep in mind that we DO NOT skip "self"
+                if (!other->active) continue;
+                if (other->lastCollisionQueryId == queryId) continue;
+                other->lastCollisionQueryId = queryId;
+
+                if (filterByObject && !VM_isObjectOrDescendant(runner->dataWin, other->objectIndex, target)) continue;
+                if (filterByInstanceId && other->instanceId != (uint32_t) target) continue;
+
+                InstanceBBox bbox = Collision_computeBBox(ctx->dataWin, other);
+                if (!bbox.valid) continue;
+
+                if (bbox.left > px || px >= bbox.right || bbox.top > py || py >= bbox.bottom) continue;
+
+                found = true;
+                break;
+            }
+        }
+    }
+
+    return RValue_makeBool(found);
 }
 
 // Misc stubs
@@ -6718,7 +6867,7 @@ static RValue builtinActionIfVariable(VMContext* ctx, MAYBE_UNUSED RValue* args,
 
     int32_t idx = check ? 1 : 2;
     RValue result = args[idx];
-    args[idx].ownsString = false; // Steal ownership to avoid double-free in handleCall
+    args[idx].ownsReference = false; // Steal ownership to avoid double-free in handleCall
     return result;
 }
 
@@ -6823,7 +6972,7 @@ static void instanceSetLayerActiveState(Runner* runner, int32_t layerId, bool is
         RoomLayerInstancesData* layerData = layer->instancesData;
 
         repeat(layerData->instanceCount, instanceIndex) {
-            Instance* inst = hmget(runner->instancesToId, layerData->instanceIds[instanceIndex]);
+            Instance* inst = hmget(runner->instancesById, layerData->instanceIds[instanceIndex]);
             if (inst != nullptr && !inst->destroyed)
                 inst->active = isActive;
         }
@@ -7405,8 +7554,8 @@ static RValue builtinNewGMLObject(VMContext* ctx, RValue* args, int32_t argCount
         if (rawArg >= 0 && (uint32_t) rawArg < ctx->dataWin->func.functionCount) {
             const char* funcName = ctx->dataWin->func.functions[rawArg].name;
             if (funcName != nullptr) {
-                ptrdiff_t idx = shgeti(ctx->funcMap, (char*) funcName);
-                if (idx >= 0) codeIndex = ctx->funcMap[idx].value;
+                ptrdiff_t idx = shgeti(ctx->codeIndexByName, (char*) funcName);
+                if (idx >= 0) codeIndex = ctx->codeIndexByName[idx].value;
             }
         }
     }
@@ -7416,8 +7565,11 @@ static RValue builtinNewGMLObject(VMContext* ctx, RValue* args, int32_t argCount
     }
 
     Instance* structInst = Instance_create(runner->nextInstanceId++, -1, 0, 0);
-    hmput(runner->instancesToId, structInst->instanceId, structInst);
+    hmput(runner->instancesById, structInst->instanceId, structInst);
+    structInst->structRegistryIndex = (int32_t) arrlen(runner->structInstances);
     arrput(runner->structInstances, structInst);
+    // Two refs at birth: one for the registry's implicit ref (structInstances), one for the returned RValue.
+    structInst->refCount = 2;
 
     Instance* savedSelf = (Instance*) ctx->currentInstance;
     ctx->currentInstance = structInst;
@@ -7428,7 +7580,7 @@ static RValue builtinNewGMLObject(VMContext* ctx, RValue* args, int32_t argCount
     RValue_free(&result);
 
     ctx->currentInstance = savedSelf;
-    return RValue_makeInt32((int32_t) structInst->instanceId);
+    return RValue_makeStruct(structInst);
 }
 #endif
 
@@ -7869,7 +8021,7 @@ static RValue builtinStringHashToNewline(MAYBE_UNUSED VMContext* ctx, RValue* ar
     PreprocessedText result = TextUtils_preprocessGmlText(original.string);
     if (!result.owning) {
         // No # found, steal the reference to avoid copying the string
-        args[0].ownsString = false;
+        args[0].ownsReference = false;
         return original;
     }
     return RValue_makeOwnedString((char*) result.text);
@@ -8145,6 +8297,56 @@ static RValue builtinAssetGetIndex(VMContext* ctx, RValue* args, int32_t argCoun
     return RValue_makeReal(-1);
 }
 
+static RValue builtinGpuSetBlendMode(VMContext* ctx, RValue* args, int32_t argCount) {
+    int mode = RValue_toReal(args[0]);
+    ctx->runner->renderer->vtable->gpuSetBlendMode(ctx->runner->renderer, mode);
+    return RValue_makeUndefined();
+}
+
+static RValue builtinGpuSetBlendModeExt(VMContext* ctx, RValue* args, int32_t argCount) {
+    int sfactor = RValue_toReal(args[0]);
+    int dfactor = RValue_toReal(args[1]);
+    ctx->runner->renderer->vtable->gpuSetBlendModeExt(ctx->runner->renderer, sfactor, dfactor);
+    return RValue_makeUndefined();
+}
+
+static RValue builtinGpuSetBlendEnable(VMContext* ctx, RValue* args, int32_t argCount) {
+    bool enable = RValue_toBool(args[0]);
+    ctx->runner->renderer->vtable->gpuSetBlendEnable(ctx->runner->renderer, enable);
+    return RValue_makeUndefined();
+}
+
+static RValue builtinGpuSetAlphaTestEnable(VMContext* ctx, RValue* args, int32_t argCount) {
+    bool enable = RValue_toBool(args[0]);
+    ctx->runner->renderer->vtable->gpuSetAlphaTestEnable(ctx->runner->renderer, enable);
+    return RValue_makeUndefined();
+}
+
+static RValue builtinGpuSetAlphaTestRef(VMContext* ctx, RValue* args, int32_t argCount) {
+    ctx->runner->renderer->vtable->gpuSetAlphaTestRef(ctx->runner->renderer, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtinGpuSetColorWriteEnable(VMContext* ctx, RValue* args, int32_t argCount) {
+    bool r, g, b, a;
+    if (argCount == 1 && args[0].type == RVALUE_ARRAY && args[0].array != nullptr && GMLArray_length1D(args[0].array) >= 4) {
+        GMLArray* arr = args[0].array;
+        r = RValue_toBool(*GMLArray_slot(arr, 0));
+        g = RValue_toBool(*GMLArray_slot(arr, 1));
+        b = RValue_toBool(*GMLArray_slot(arr, 2));
+        a = RValue_toBool(*GMLArray_slot(arr, 3));
+    } else if (argCount >= 4) {
+        r = RValue_toBool(args[0]);
+        g = RValue_toBool(args[1]);
+        b = RValue_toBool(args[2]);
+        a = RValue_toBool(args[3]);
+    } else {
+        return RValue_makeUndefined();
+    }
+    ctx->runner->renderer->vtable->gpuSetColorWriteEnable(ctx->runner->renderer, r, g, b, a);
+    return RValue_makeUndefined();
+}
+
 // ===[ REGISTRATION ]===
 
 void VMBuiltins_registerAll(VMContext* ctx) {
@@ -8402,6 +8604,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "window_center", builtin_window_center);
     VM_registerBuiltin(ctx, "window_get_width", builtinWindowGetWidth);
     VM_registerBuiltin(ctx, "window_get_height", builtinWindowGetHeight);
+    VM_registerBuiltin(ctx, "window_has_focus", builtinWindowHasFocus);
 
     // Game
     VM_registerBuiltin(ctx, "game_restart", builtinGameRestart);
@@ -8413,6 +8616,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "instance_exists", builtinInstanceExists);
     VM_registerBuiltin(ctx, "instance_number", builtinInstanceNumber);
     VM_registerBuiltin(ctx, "instance_find", builtinInstanceFind);
+    VM_registerBuiltin(ctx, "instance_nearest", builtinInstanceNearest);
     VM_registerBuiltin(ctx, "instance_destroy", builtinInstanceDestroy);
     if(!isGMS2) {
         VM_registerBuiltin(ctx, "instance_create", builtinInstanceCreate);
@@ -8472,6 +8676,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "draw_sprite_pos", builtin_drawSpritePos);
     VM_registerBuiltin(ctx, "draw_rectangle", builtin_drawRectangle);
     VM_registerBuiltin(ctx, "draw_rectangle_color", builtin_drawRectangleColor);
+    VM_registerBuiltin(ctx, "draw_rectangle_colour", builtin_drawRectangleColor);
     VM_registerBuiltin(ctx, "draw_circle", builtin_drawCircle); 
     VM_registerBuiltin(ctx, "draw_circle_color", builtin_drawCircleColor); 
     VM_registerBuiltin(ctx, "draw_healthbar", builtin_drawHealthbar);
@@ -8486,15 +8691,15 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "draw_text", builtin_drawText);
     VM_registerBuiltin(ctx, "draw_text_transformed", builtin_drawTextTransformed);
     VM_registerBuiltin(ctx, "draw_text_ext", builtin_drawTextExt);
-    VM_registerBuiltin(ctx, "draw_text_ext_transformed", builtin_draw_text_ext_transformed);
+    VM_registerBuiltin(ctx, "draw_text_ext_transformed", builtin_drawTextExtTransformed);
     VM_registerBuiltin(ctx, "draw_text_color", builtin_drawTextColor);
     VM_registerBuiltin(ctx, "draw_text_color_transformed", builtin_drawTextColorTransformed);
-    VM_registerBuiltin(ctx, "draw_text_color_ext", builtin_draw_text_color_ext);
-    VM_registerBuiltin(ctx, "draw_text_color_ext_transformed", builtin_draw_text_color_ext_transformed);
+    VM_registerBuiltin(ctx, "draw_text_color_ext", builtin_drawTextColorExt);
+    VM_registerBuiltin(ctx, "draw_text_color_ext_transformed", builtin_drawTextColorExtTransformed);
     VM_registerBuiltin(ctx, "draw_text_colour", builtin_drawTextColor);
     VM_registerBuiltin(ctx, "draw_text_colour_transformed", builtin_drawTextColorTransformed);
-    VM_registerBuiltin(ctx, "draw_text_colour_ext", builtin_draw_text_color_ext);
-    VM_registerBuiltin(ctx, "draw_text_colour_ext_transformed", builtin_draw_text_color_ext_transformed);
+    VM_registerBuiltin(ctx, "draw_text_colour_ext", builtin_drawTextColorExt);
+    VM_registerBuiltin(ctx, "draw_text_colour_ext_transformed", builtin_drawTextColorExtTransformed);
     VM_registerBuiltin(ctx, "draw_surface", builtin_draw_surface);
     VM_registerBuiltin(ctx, "draw_surface_ext", builtin_draw_surface_ext);
     VM_registerBuiltin(ctx, "draw_surface_part", builtin_draw_surface_part);   
@@ -8519,14 +8724,14 @@ void VMBuiltins_registerAll(VMContext* ctx) {
 
     //GPU
     //Setters
-    VM_registerBuiltin(ctx, "gpu_set_blendmode", builtin_gpu_set_blendmode);
-    VM_registerBuiltin(ctx, "gpu_set_blendmode_ext", builtin_gpu_set_blendmode_ext);
-    VM_registerBuiltin(ctx, "gpu_set_colorwriteenable", builtin_gpu_set_color_write_enable);
-    VM_registerBuiltin(ctx, "gpu_set_colourwriteenable", builtin_gpu_set_color_write_enable);
-    VM_registerBuiltin(ctx, "gpu_set_blendenable", builtin_gpu_set_blendenable);
-    VM_registerBuiltin(ctx, "gpu_set_alphatestref", builtin_gpu_set_alphatestref);
+    //VM_registerBuiltin(ctx, "gpu_set_blendmode", builtin_gpu_set_blendmode);
+    //VM_registerBuiltin(ctx, "gpu_set_blendmode_ext", builtin_gpu_set_blendmode_ext);
+    //VM_registerBuiltin(ctx, "gpu_set_colorwriteenable", builtin_gpu_set_color_write_enable);
+    //VM_registerBuiltin(ctx, "gpu_set_colourwriteenable", builtin_gpu_set_color_write_enable);
+    //VM_registerBuiltin(ctx, "gpu_set_blendenable", builtin_gpu_set_blendenable);
+    //VM_registerBuiltin(ctx, "gpu_set_alphatestref", builtin_gpu_set_alphatestref);
     //Getters
-    VM_registerBuiltin(ctx, "gpu_get_blendenable", builtin_gpu_get_blendenabled);
+    //VM_registerBuiltin(ctx, "gpu_get_blendenable", builtin_gpu_get_blendenabled);
 
   
     // Color
@@ -8592,6 +8797,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "collision_point", builtinCollisionPoint);
     VM_registerBuiltin(ctx, "instance_place", builtinInstancePlace);
     VM_registerBuiltin(ctx, "instance_position", builtinInstancePosition);
+    VM_registerBuiltin(ctx, "position_meeting", builtinPositionMeeting);
     VM_registerBuiltin(ctx, "place_free", builtinPlaceFree);
     VM_registerBuiltin(ctx, "place_empty", builtinPlaceEmpty);
 
@@ -8699,5 +8905,11 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "font_add_sprite_ext", builtinFontAddSpriteExt);
     VM_registerBuiltin(ctx, "object_get_sprite", builtinObjectGetSprite);
     VM_registerBuiltin(ctx, "asset_get_index", builtinAssetGetIndex);
+    VM_registerBuiltin(ctx,"gpu_set_blendmode", builtinGpuSetBlendMode);
+    VM_registerBuiltin(ctx,"gpu_set_blendmode_ext", builtinGpuSetBlendModeExt);
+    VM_registerBuiltin(ctx,"gpu_set_blendenable", builtinGpuSetBlendEnable);
+    VM_registerBuiltin(ctx,"gpu_set_alphatestenable", builtinGpuSetAlphaTestEnable);
+    VM_registerBuiltin(ctx,"gpu_set_alphatestref", builtinGpuSetAlphaTestRef);
+    VM_registerBuiltin(ctx,"gpu_set_colorwriteenable", builtinGpuSetColorWriteEnable);
 }
 

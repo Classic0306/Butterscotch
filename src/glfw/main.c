@@ -32,6 +32,60 @@
 #include "utils.h"
 #include "profiler.h"
 
+static void glfwErrorCallback(int code, const char* description) {
+    fprintf(stderr, "GLFW error 0x%x: %s\n", code, description);
+}
+
+static void APIENTRY glDebugCallback(GLenum source, GLenum type, GLuint id, GLenum severity, MAYBE_UNUSED GLsizei length, const GLchar* message, MAYBE_UNUSED const void* userParam) {
+    const char* sourceStr;
+    switch (source) {
+        case GL_DEBUG_SOURCE_API: sourceStr = "API"; break;
+        case GL_DEBUG_SOURCE_WINDOW_SYSTEM: sourceStr = "Window System"; break;
+        case GL_DEBUG_SOURCE_SHADER_COMPILER: sourceStr = "Shader Compiler"; break;
+        case GL_DEBUG_SOURCE_THIRD_PARTY: sourceStr = "Third Party"; break;
+        case GL_DEBUG_SOURCE_APPLICATION: sourceStr = "Application"; break;
+        case GL_DEBUG_SOURCE_OTHER: sourceStr = "Other"; break;
+        default: sourceStr = "Unknown"; break;
+    }
+
+    const char* typeStr;
+    switch (type) {
+        case GL_DEBUG_TYPE_ERROR: typeStr = "Error"; break;
+        case GL_DEBUG_TYPE_DEPRECATED_BEHAVIOR: typeStr = "Deprecated Behaviour"; break;
+        case GL_DEBUG_TYPE_UNDEFINED_BEHAVIOR: typeStr = "Undefined Behaviour"; break;
+        case GL_DEBUG_TYPE_PORTABILITY: typeStr = "Portability"; break;
+        case GL_DEBUG_TYPE_PERFORMANCE: typeStr = "Performance"; break;
+        case GL_DEBUG_TYPE_MARKER: typeStr = "Marker"; break;
+        case GL_DEBUG_TYPE_PUSH_GROUP: typeStr = "Push Group"; break;
+        case GL_DEBUG_TYPE_POP_GROUP: typeStr = "Pop Group"; break;
+        case GL_DEBUG_TYPE_OTHER: typeStr = "Other"; break;
+        default: typeStr = "Unknown"; break;
+    }
+
+    const char* severityStr;
+    switch (severity) {
+        case GL_DEBUG_SEVERITY_HIGH: severityStr = "High"; break;
+        case GL_DEBUG_SEVERITY_MEDIUM: severityStr = "Medium"; break;
+        case GL_DEBUG_SEVERITY_LOW: severityStr = "Low"; break;
+        case GL_DEBUG_SEVERITY_NOTIFICATION: severityStr = "Notification"; break;
+        default: severityStr = "Unknown"; break;
+    }
+
+    fprintf(stderr, "[OpenGL %s] id=%u Type: %s; Severity: %s; Message: %.*s\n", sourceStr, id, typeStr, severityStr, (int) length, message);
+}
+
+static void installGLDebugCallback(void) {
+    if (!GLAD_GL_KHR_debug) {
+        fprintf(stderr, "OpenGL debug callback not available (driver does not expose GL_KHR_debug)\n");
+        return;
+    }
+
+    glEnable(GL_DEBUG_OUTPUT);
+    glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+    glDebugMessageCallbackKHR(glDebugCallback, nullptr);
+    glDebugMessageControlKHR(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, nullptr, GL_TRUE);
+}
+
 // ===[ COMMAND LINE ARGUMENTS ]===
 typedef struct {
     int key;
@@ -77,6 +131,9 @@ typedef struct {
     bool lazyRooms;
     StringBooleanEntry* eagerRooms; // stb_ds string-keyed set of room names
     int profilerFramesBetween; // 0 = disabled
+#ifdef ENABLE_VM_OPCODE_PROFILER
+    bool opcodeProfiler;
+#endif
 } CommandLineArgs;
 
 typedef struct { const char* name; YoYoOperatingSystem value; } OsTypeNameEntry;
@@ -162,7 +219,10 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
         {"lazy-rooms", no_argument, nullptr, 'z'},
         {"eager-room", required_argument, nullptr, 'G'},
         {"os-type", required_argument, nullptr, 'O'},
-        {"profiler", required_argument, nullptr, 'q'},
+        {"profile-gml-scripts", required_argument, nullptr, 'q'},
+#ifdef ENABLE_VM_OPCODE_PROFILER
+        {"profile-opcodes", no_argument, nullptr, 'Q'},
+#endif
         {nullptr,               0,                 nullptr,  0 }
     };
 
@@ -328,12 +388,17 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
                 char* endPtr;
                 long framesBetween = strtol(optarg, &endPtr, 10);
                 if (*endPtr != '\0' || framesBetween <= 0) {
-                    fprintf(stderr, "Error: Invalid frame count '%s' for --profiler (must be > 0)\n", optarg);
+                    fprintf(stderr, "Error: Invalid frame count '%s' for --profile-gml-scripts (must be > 0)\n", optarg);
                     exit(1);
                 }
                 args->profilerFramesBetween = (int) framesBetween;
                 break;
             }
+#ifdef ENABLE_VM_OPCODE_PROFILER
+            case 'Q':
+                args->opcodeProfiler = true;
+                break;
+#endif
             case 'O':
                 if (!parseOsTypeArg(optarg, &args->osType)) {
                     fprintf(stderr, "Error: Invalid --os-type value '%s' (expected: ", optarg);
@@ -454,6 +519,48 @@ static int32_t glfwKeyToGml(int glfwKey) {
 
 static InputRecording* globalInputRecording = nullptr;
 
+#if defined(__has_feature)
+    #if __has_feature(address_sanitizer)
+        #define BUTTERSCOTCH_HAS_ASAN 1
+    #endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+    #define BUTTERSCOTCH_HAS_ASAN 1
+#endif
+
+#if BUTTERSCOTCH_HAS_ASAN
+void __asan_set_death_callback(void (*callback)(void));
+#endif
+
+static volatile sig_atomic_t crashSaveInProgress = 0;
+
+static void saveRecordingOnCrash(void) {
+    if (crashSaveInProgress) return;
+    crashSaveInProgress = 1;
+    if (globalInputRecording != nullptr && globalInputRecording->isRecording) {
+        InputRecording_save(globalInputRecording);
+    }
+}
+
+static void crashSignalHandler(int sig) {
+    saveRecordingOnCrash();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void installCrashHandlers(void) {
+#if BUTTERSCOTCH_HAS_ASAN
+    __asan_set_death_callback(saveRecordingOnCrash);
+#endif
+    signal(SIGSEGV, crashSignalHandler);
+    signal(SIGABRT, crashSignalHandler);
+#ifdef SIGBUS
+    signal(SIGBUS,  crashSignalHandler);
+#endif
+    signal(SIGFPE,  crashSignalHandler);
+    signal(SIGILL,  crashSignalHandler);
+}
+
 static void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     (void) scancode; (void) mods;
     Runner* runner = (Runner*) glfwGetWindowUserPointer(window);
@@ -474,6 +581,10 @@ static void characterCallback(GLFWwindow* window, unsigned int codepoint) {
 
 static void setGlfwWindowTitle(void* window, const char* title) {
     glfwSetWindowTitle((GLFWwindow*) window, title);
+}
+
+static bool getGlfwWindowFocus(void* window) {
+    return glfwGetWindowAttrib((GLFWwindow*) window, GLFW_FOCUSED) != 0;
 }
 
 void saveInputRecording() {
@@ -556,6 +667,13 @@ int main(int argc, char* argv[]) {
     VMContext* vm = VM_create(dataWin);
 
     Profiler_setEnabled(&vm->profiler, args.profilerFramesBetween > 0);
+#ifdef ENABLE_VM_OPCODE_PROFILER
+    vm->opcodeProfilerEnabled = args.opcodeProfiler;
+    if (vm->opcodeProfilerEnabled) {
+        vm->opcodeVariantCounts = safeCalloc(256 * 256, sizeof(uint64_t));
+        vm->opcodeRValueTypeCounts = safeCalloc(256 * 256, sizeof(uint64_t));
+    }
+#endif
 
     if (args.hasSeed) {
         srand((unsigned int) args.seed);
@@ -601,8 +719,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (args.printDeclaredFunctions) {
-        repeat(hmlen(vm->funcMap), i) {
-            printf("[%d] %s\n", vm->funcMap[i].value, vm->funcMap[i].key);
+        repeat(hmlen(vm->codeIndexByName), i) {
+            printf("[%d] %s\n", vm->codeIndexByName[i].value, vm->codeIndexByName[i].key);
         }
         VM_free(vm);
         DataWin_free(dataWin);
@@ -618,9 +736,9 @@ int main(int argc, char* argv[]) {
         } else {
             for (ptrdiff_t i = 0; shlen(args.disassemble) > i; i++) {
                 const char* name = args.disassemble[i].key;
-                ptrdiff_t idx = shgeti(vm->funcMap, (char*) name);
+                ptrdiff_t idx = shgeti(vm->codeIndexByName, (char*) name);
                 if (idx >= 0) {
-                    VM_disassemble(vm, vm->funcMap[idx].value);
+                    VM_disassemble(vm, vm->codeIndexByName[idx].value);
                 } else {
                     fprintf(stderr, "Error: Script '%s' not found in funcMap\n", name);
                 }
@@ -636,11 +754,24 @@ int main(int argc, char* argv[]) {
     GlfwFileSystem* glfwFileSystem = GlfwFileSystem_create(args.dataWinPath);
 
     // Init GLFW
+    glfwSetErrorCallback(glfwErrorCallback);
     if (!glfwInit()) {
         fprintf(stderr, "Failed to initialize GLFW\n");
         DataWin_free(dataWin);
         freeCommandLineArgs(&args);
         return 1;
+    }
+
+    bool modernGL = strcmp(args.renderer, "legacy-gl") != 0;
+    if (!modernGL) {
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 1);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    } else {
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
+        glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+        glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GL_TRUE);
     }
 
     // Load SDL gamecontroller mappings
@@ -662,15 +793,6 @@ int main(int argc, char* argv[]) {
         } else {
             fprintf(stderr, "Gamepad: SDL gamecontrollerdb.txt not found at %s, using defaults\n", dbPath);
         }
-    }
-
-    if (strcmp(args.renderer, "legacy-gl") == 0) {
-        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE);
-    } else {
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
-        glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
-        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     }
 
     if (args.headless) {
@@ -699,6 +821,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Install the OpenGL debug message callback
+    if (modernGL)
+        installGLDebugCallback();
+
     // Initialize the renderer
     Renderer* renderer = nullptr;
     if(strcmp(args.renderer, "legacy-gl") == 0)
@@ -720,12 +846,16 @@ int main(int argc, char* argv[]) {
     runner->osType = args.osType;
     runner->nativeWindow = window;
     runner->setWindowTitle = setGlfwWindowTitle;
+    runner->windowHasFocus = getGlfwWindowFocus;
 
     // Set up input recording/playback (both can be active: playback then continue recording)
     if (args.playbackInputsPath != nullptr) {
         globalInputRecording = InputRecording_createPlayer(args.playbackInputsPath, args.recordInputsPath);
     } else if (args.recordInputsPath != nullptr) {
         globalInputRecording = InputRecording_createRecorder(args.recordInputsPath);
+    }
+    if (globalInputRecording != nullptr) {
+        installCrashHandlers();
     }
     shcopyFromTo(args.varReadsToBeTraced, runner->vmContext->varReadsToBeTraced);
     shcopyFromTo(args.varWritesToBeTraced, runner->vmContext->varWritesToBeTraced);
@@ -914,8 +1044,9 @@ int main(int argc, char* argv[]) {
         glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
 
         // Clear the default framebuffer (window background) to black
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        if (!(strcmp(args.renderer, "legacy-gl") == 0)) {
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
         glClear(GL_COLOR_BUFFER_BIT);
 
         int32_t gameW = (int32_t) gen8->defaultWindowWidth;
@@ -1027,9 +1158,11 @@ int main(int argc, char* argv[]) {
         if (shouldScreenshot) {
             // Bind FBO so glReadPixels reads from the game's native-resolution texture
             GLRenderer* gl = (GLRenderer*) renderer;
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, gl->fbo);
+            if (!(strcmp(args.renderer, "legacy-gl") == 0))
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, gl->fbo);
             captureScreenshot(args.screenshotPattern, runner->frameCount, gameW, gameH);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+            if (!(strcmp(args.renderer, "legacy-gl") == 0))
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
         }
 
         if (args.exitAtFrame >= 0 && runner->frameCount >= args.exitAtFrame) {
@@ -1082,6 +1215,9 @@ int main(int argc, char* argv[]) {
 
     Runner_free(runner);
     GlfwFileSystem_destroy(glfwFileSystem);
+#ifdef ENABLE_VM_OPCODE_PROFILER
+    VM_printOpcodeProfilerReport(vm);
+#endif
     VM_free(vm);
     DataWin_free(dataWin);
 

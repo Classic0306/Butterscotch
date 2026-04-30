@@ -40,11 +40,12 @@ static const char* fragmentShaderSource =
     "in vec4 vColor;\n"
     "uniform float uAlphaRef;\n"
     "uniform sampler2D uTexture;\n"
+    "uniform float uAlphaTestRef;\n" // negative = disabled
     "out vec4 fragColor;\n"
     "void main() {\n"
-    "   fragColor = texture(uTexture, vTexCoord) * vColor;\n"
-    "   if (fragColor.a < uAlphaRef)\n"
-    "       discard;\n"
+    "    vec4 c = texture(uTexture, vTexCoord) * vColor;\n"
+    "    if (uAlphaTestRef >= c.a) discard;\n"
+    "    fragColor = c;\n"
     "}\n";
 
 // ===[ Blend Factors ]===
@@ -166,8 +167,11 @@ static void glInit(Renderer* renderer, DataWin* dataWin) {
 
     gl->uProjection = glGetUniformLocation(gl->shaderProgram, "uProjection");
     gl->uTexture = glGetUniformLocation(gl->shaderProgram, "uTexture");
-    gl->uAlphaRef = glGetUniformLocation(gl->shaderProgram, "uAlphaRef");
-    glUniform1f(gl->uAlphaRef, 0.0f);
+    gl->uAlphaTestRef = glGetUniformLocation(gl->shaderProgram, "uAlphaTestRef");
+    gl->alphaTestEnable = false;
+    gl->alphaTestRef = 0.0f;
+    glUseProgram(gl->shaderProgram);
+    glUniform1f(gl->uAlphaTestRef, -1.0f);
 
     // Create VAO/VBO/EBO
     glGenVertexArrays(1, &gl->vao);
@@ -459,29 +463,55 @@ static bool ensureTextureLoaded(GLRenderer* gl, uint32_t pageId) {
     return true;
 }
 
-static void glDrawSprite(Renderer* renderer, int32_t tpagIndex, float x, float y, float originX, float originY, float xscale, float yscale, float angleDeg, uint32_t color, float alpha) {
-    GLRenderer* gl = (GLRenderer*) renderer;
-    DataWin* dw = renderer->dataWin;
-
-    if (0 > tpagIndex || dw->tpag.count <= (uint32_t) tpagIndex) return;
-
+// Resolves a TPAG index to a loaded GL texture. Returns false if drawing should be skipped.
+static bool resolveSpriteTexture(GLRenderer* gl, int32_t tpagIndex, TexturePageItem** outTpag, GLuint* outTexId, int32_t* outTexW, int32_t* outTexH) {
+    DataWin* dw = gl->base.dataWin;
+    if (0 > tpagIndex || dw->tpag.count <= (uint32_t) tpagIndex) return false;
     TexturePageItem* tpag = &dw->tpag.items[tpagIndex];
     int16_t pageId = tpag->texturePageId;
-    if (0 > pageId || gl->textureCount <= (uint32_t) pageId) return;
-    if (!ensureTextureLoaded(gl, (uint32_t) pageId)) return;
+    if (0 > pageId || gl->textureCount <= (uint32_t) pageId) return false;
+    if (!ensureTextureLoaded(gl, (uint32_t) pageId)) return false;
+    *outTpag = tpag;
+    *outTexId = gl->glTextures[pageId];
+    *outTexW = gl->textureWidths[pageId];
+    *outTexH = gl->textureHeights[pageId];
+    return true;
+}
 
-    GLuint texId = gl->glTextures[pageId];
-    int32_t texW = gl->textureWidths[pageId];
-    int32_t texH = gl->textureHeights[pageId];
-
-    // Flush if texture changed or batch full
-    if (gl->quadCount > 0 && gl->currentTextureId != texId) {
-        flushBatch(gl);
-    }
-    if (gl->quadCount >= MAX_QUADS) {
-        flushBatch(gl);
-    }
+// Emits a single textured quad into the batch given 4 final screen-space corners (TL, TR, BR, BL), 4 UVs forming a rect (u0,v0)-(u1,v1), and a flat color/alpha.
+// Handles texture rebinding and batch flushing.
+static void emitTexturedQuad(GLRenderer* gl, GLuint texId, float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, float u0, float v0, float u1, float v1, float r, float g, float b, float alpha) {
+    if (gl->quadCount > 0 && gl->currentTextureId != texId) flushBatch(gl);
+    if (gl->quadCount >= MAX_QUADS) flushBatch(gl);
     gl->currentTextureId = texId;
+
+    float* verts = gl->vertexData + gl->quadCount * VERTICES_PER_QUAD * FLOATS_PER_VERTEX;
+
+    // Vertex 0: top-left
+    verts[0] = x0; verts[1] = y0; verts[2] = u0; verts[3] = v0;
+    verts[4] = r;  verts[5] = g;  verts[6] = b;  verts[7] = alpha;
+
+    // Vertex 1: top-right
+    verts[8]  = x1; verts[9]  = y1; verts[10] = u1; verts[11] = v0;
+    verts[12] = r;  verts[13] = g;  verts[14] = b;  verts[15] = alpha;
+
+    // Vertex 2: bottom-right
+    verts[16] = x2; verts[17] = y2; verts[18] = u1; verts[19] = v1;
+    verts[20] = r;  verts[21] = g;  verts[22] = b;  verts[23] = alpha;
+
+    // Vertex 3: bottom-left
+    verts[24] = x3; verts[25] = y3; verts[26] = u0; verts[27] = v1;
+    verts[28] = r;  verts[29] = g;  verts[30] = b;  verts[31] = alpha;
+
+    gl->quadCount++;
+}
+
+static void glDrawSprite(Renderer* renderer, int32_t tpagIndex, float x, float y, float originX, float originY, float xscale, float yscale, float angleDeg, uint32_t color, float alpha) {
+    GLRenderer* gl = (GLRenderer*) renderer;
+    TexturePageItem* tpag;
+    GLuint texId;
+    int32_t texW, texH;
+    if (!resolveSpriteTexture(gl, tpagIndex, &tpag, &texId, &texW, &texH)) return;
 
     // Compute normalized UVs from TPAG source rect
     float u0 = (float) tpag->sourceX / (float) texW;
@@ -514,29 +544,10 @@ static void glDrawSprite(Renderer* renderer, int32_t tpagIndex, float x, float y
     float g = (float) BGR_G(color) / 255.0f;
     float b = (float) BGR_B(color) / 255.0f;
 
-    // Write 4 vertices into batch buffer
-    float* verts = gl->vertexData + gl->quadCount * VERTICES_PER_QUAD * FLOATS_PER_VERTEX;
-
-    // Vertex 0: top-left
-    verts[0] = x0; verts[1] = y0; verts[2] = u0; verts[3] = v0;
-    verts[4] = r;  verts[5] = g;  verts[6] = b;  verts[7] = alpha;
-
-    // Vertex 1: top-right
-    verts[8]  = x1; verts[9]  = y1; verts[10] = u1; verts[11] = v0;
-    verts[12] = r;  verts[13] = g;  verts[14] = b;  verts[15] = alpha;
-
-    // Vertex 2: bottom-right
-    verts[16] = x2; verts[17] = y2; verts[18] = u1; verts[19] = v1;
-    verts[20] = r;  verts[21] = g;  verts[22] = b;  verts[23] = alpha;
-
-    // Vertex 3: bottom-left
-    verts[24] = x3; verts[25] = y3; verts[26] = u0; verts[27] = v1;
-    verts[28] = r;  verts[29] = g;  verts[30] = b;  verts[31] = alpha;
-
-    gl->quadCount++;
+    emitTexturedQuad(gl, texId, x0, y0, x1, y1, x2, y2, x3, y3, u0, v0, u1, v1, r, g, b, alpha);
 }
 
-static void glDrawSpritePart(Renderer* renderer, int32_t tpagIndex, int32_t srcOffX, int32_t srcOffY, int32_t srcW, int32_t srcH, float x, float y, float xscale, float yscale, uint32_t color, float alpha) {
+static void glDrawSpritePart(Renderer* renderer, int32_t tpagIndex, int32_t srcOffX, int32_t srcOffY, int32_t srcW, int32_t srcH, float x, float y, float xscale, float yscale, float angleDeg, float pivotX, float pivotY, uint32_t color, float alpha) {
     GLRenderer* gl = (GLRenderer*) renderer;
     DataWin* dw = renderer->dataWin;
 
@@ -550,11 +561,6 @@ static void glDrawSpritePart(Renderer* renderer, int32_t tpagIndex, int32_t srcO
     GLuint texId = gl->glTextures[pageId];
     int32_t texW = gl->textureWidths[pageId];
     int32_t texH = gl->textureHeights[pageId];
-
-    // Flush if texture changed or batch full
-    if (gl->quadCount > 0 && gl->currentTextureId != texId) flushBatch(gl);
-    if (gl->quadCount >= MAX_QUADS) flushBatch(gl);
-    gl->currentTextureId = texId;
 
     // Compute UVs for the sub-region within the atlas
     float u0 = (float) (tpag->sourceX + srcOffX) / (float) texW;
@@ -562,114 +568,57 @@ static void glDrawSpritePart(Renderer* renderer, int32_t tpagIndex, int32_t srcO
     float u1 = (float) (tpag->sourceX + srcOffX + srcW) / (float) texW;
     float v1 = (float) (tpag->sourceY + srcOffY + srcH) / (float) texH;
 
-    // Quad corners (no origin offset, no transform - draw_sprite_part ignores sprite origin)
-    float x0 = x;
-    float y0 = y;
-    float x1 = x + (float) srcW * xscale;
-    float y1 = y + (float) srcH * yscale;
-
     // Convert BGR color to RGB floats
     float r = (float) BGR_R(color) / 255.0f;
     float g = (float) BGR_G(color) / 255.0f;
     float b = (float) BGR_B(color) / 255.0f;
 
-    // Write 4 vertices into batch buffer
-    float* verts = gl->vertexData + gl->quadCount * VERTICES_PER_QUAD * FLOATS_PER_VERTEX;
+    // Quad corners (no origin offset - draw_sprite_part ignores sprite origin)
+    float cx0, cy0, cx1, cy1, cx2, cy2, cx3, cy3;
+    if (angleDeg == 0.0f) {
+        cx0 = x;                         cy0 = y;
+        cx1 = x + (float) srcW * xscale; cy1 = y;
+        cx2 = x + (float) srcW * xscale; cy2 = y + (float) srcH * yscale;
+        cx3 = x;                         cy3 = y + (float) srcH * yscale;
+    } else {
+        float angleRad = -angleDeg * ((float) M_PI / 180.0f);
+        float cosA = cosf(angleRad);
+        float sinA = sinf(angleRad);
+        float qx0 = x,                         qy0 = y;
+        float qx1 = x + (float) srcW * xscale, qy1 = y;
+        float qx2 = x + (float) srcW * xscale, qy2 = y + (float) srcH * yscale;
+        float qx3 = x,                         qy3 = y + (float) srcH * yscale;
+        float dx, dy;
+        dx = qx0 - pivotX; dy = qy0 - pivotY; cx0 = cosA * dx - sinA * dy + pivotX; cy0 = sinA * dx + cosA * dy + pivotY;
+        dx = qx1 - pivotX; dy = qy1 - pivotY; cx1 = cosA * dx - sinA * dy + pivotX; cy1 = sinA * dx + cosA * dy + pivotY;
+        dx = qx2 - pivotX; dy = qy2 - pivotY; cx2 = cosA * dx - sinA * dy + pivotX; cy2 = sinA * dx + cosA * dy + pivotY;
+        dx = qx3 - pivotX; dy = qy3 - pivotY; cx3 = cosA * dx - sinA * dy + pivotX; cy3 = sinA * dx + cosA * dy + pivotY;
+    }
 
-    // Vertex 0: top-left
-    verts[0] = x0; verts[1] = y0; verts[2] = u0; verts[3] = v0;
-    verts[4] = r;  verts[5] = g;  verts[6] = b;  verts[7] = alpha;
-
-    // Vertex 1: top-right
-    verts[8]  = x1; verts[9]  = y0; verts[10] = u1; verts[11] = v0;
-    verts[12] = r;  verts[13] = g;  verts[14] = b;  verts[15] = alpha;
-
-    // Vertex 2: bottom-right
-    verts[16] = x1; verts[17] = y1; verts[18] = u1; verts[19] = v1;
-    verts[20] = r;  verts[21] = g;  verts[22] = b;  verts[23] = alpha;
-
-    // Vertex 3: bottom-left
-    verts[24] = x0; verts[25] = y1; verts[26] = u0; verts[27] = v1;
-    verts[28] = r;  verts[29] = g;  verts[30] = b;  verts[31] = alpha;
-
-    gl->quadCount++;
+    emitTexturedQuad(gl, texId, cx0, cy0, cx1, cy1, cx2, cy2, cx3, cy3, u0, v0, u1, v1, r, g, b, alpha);
 }
 
-static void glDrawSpritePos(Renderer* renderer, int32_t tpagIndex, float originX, float originY, float x1, float y1, float x2, float y2, float x3, float y3, float x4, float y4, float alpha) {
+static void glDrawSpritePos(Renderer* renderer, int32_t tpagIndex, float x1, float y1, float x2, float y2, float x3, float y3, float x4, float y4, float alpha) {
     GLRenderer* gl = (GLRenderer*) renderer;
-    DataWin* dw = renderer->dataWin;
+    TexturePageItem* tpag;
+    GLuint texId;
+    int32_t texW, texH;
+    if (!resolveSpriteTexture(gl, tpagIndex, &tpag, &texId, &texW, &texH)) return;
 
-    if (0 > tpagIndex || dw->tpag.count <= (uint32_t) tpagIndex) return;
-
-    TexturePageItem* tpag = &dw->tpag.items[tpagIndex];
-    int16_t pageId = tpag->texturePageId;
-    if (0 > pageId || gl->textureCount <= (uint32_t) pageId) return;
-    if (!ensureTextureLoaded(gl, (uint32_t) pageId)) return;
-
-    GLuint texId = gl->glTextures[pageId];
-    int32_t texW = gl->textureWidths[pageId];
-    int32_t texH = gl->textureHeights[pageId];
-
-    // Flush if texture changed or batch full
-    if (gl->quadCount > 0 && gl->currentTextureId != texId) flushBatch(gl);
-    if (gl->quadCount >= MAX_QUADS) flushBatch(gl);
-    gl->currentTextureId = texId;
-
-    // Compute UVs for the sub-region within the atlas
-    // Compute normalized UVs from TPAG source rect
     float u0 = (float) tpag->sourceX / (float) texW;
     float v0 = (float) tpag->sourceY / (float) texH;
-    float u1 = (float) (tpag->sourceX + tpag->boundingWidth) / (float) texW;
-    float v1 = (float) (tpag->sourceY + tpag->boundingHeight) / (float) texH;
+    float u1 = (float) (tpag->sourceX + tpag->sourceWidth) / (float) texW;
+    float v1 = (float) (tpag->sourceY + tpag->sourceHeight) / (float) texH;
 
-    // Quad corners (no origin offset, no transform - draw_sprite_part ignores sprite origin)
-
-    // Convert BGR color to RGB floats
-    float r = 1.0f;
-    float g = 1.0f;
-    float b = 1.0f;
-
-    // Write 4 vertices into batch buffer
-    float* verts = gl->vertexData + gl->quadCount * VERTICES_PER_QUAD * FLOATS_PER_VERTEX;
-
-    //I dunno mann putting this offset to it makes Tenna appear correctly mostly but breaks other things?
-    //I personally believe that somehow the code for Tenna's animations isn't working properly
-    //If you see issues with other games that use this, PLEASE REMOVE THE OFFSET I PUT HERE.
-    //yeah yeah I did just copy and paste similar functions and modify it but hey it worky! yay!
-
-    // Vertex 0: top-left
-    verts[0] = x1-originX; verts[1] = y1-originY; verts[2] = u0; verts[3] = v0;
-    verts[4] = r;  verts[5] = g;  verts[6] = b;  verts[7] = alpha;
-
-    // Vertex 1: top-right
-    verts[8]  = x2-originX; verts[9]  = y2-originY; verts[10] = u1; verts[11] = v0;
-    verts[12] = r;  verts[13] = g;  verts[14] = b;  verts[15] = alpha;
-
-    // Vertex 2: bottom-right
-    verts[16] = x3-originX; verts[17] = y3-originY; verts[18] = u1; verts[19] = v1;
-    verts[20] = r;  verts[21] = g;  verts[22] = b;  verts[23] = alpha;
-
-    // Vertex 3: bottom-left
-    verts[24] = x4-originX; verts[25] = y4-originY; verts[26] = u0; verts[27] = v1;
-    verts[28] = r;  verts[29] = g;  verts[30] = b;  verts[31] = alpha;
-
-    gl->quadCount++;
+    emitTexturedQuad(gl, texId, x1, y1, x2, y2, x3, y3, x4, y4, u0, v0, u1, v1, 1.0f, 1.0f, 1.0f, alpha);
 }
-
-
-
-
-
-
 
 // Emits a single colored quad into the batch using the white pixel texture
 static void emitColoredQuad(GLRenderer* gl, float x0, float y0, float x1, float y1, float r, float g, float b, float a) {
-    if (gl->quadCount > 0 && gl->currentTextureId != gl->whiteTexture) {
-        flushBatch(gl);
-    }
-    if (gl->quadCount >= MAX_QUADS) {
-        flushBatch(gl);
-    }
+    // Flush if texture changed or batch full
+    if (gl->quadCount > 0 && gl->currentTextureId != gl->whiteTexture) flushBatch(gl);
+    if (gl->quadCount >= MAX_QUADS) flushBatch(gl);
+    
     gl->currentTextureId = gl->whiteTexture;
 
     float* verts = gl->vertexData + gl->quadCount * VERTICES_PER_QUAD * FLOATS_PER_VERTEX;
@@ -2194,6 +2143,130 @@ static void glDeleteSprite(Renderer* renderer, int32_t spriteIndex) {
     fprintf(stderr, "GL: Deleted sprite %d\n", spriteIndex);
 }
 
+static GLenum gmsBlendModeToGL(int mode) {
+    switch(mode) {    
+        case bm_zero: return GL_ZERO;
+        case bm_one: return GL_ONE;
+        case bm_src_color: return GL_SRC_COLOR;
+        case bm_inv_src_color: return GL_ONE_MINUS_SRC_COLOR;
+        case bm_src_alpha: return GL_SRC_ALPHA;
+        case bm_inv_src_alpha: return GL_ONE_MINUS_SRC_ALPHA;
+        case bm_dest_alpha: return GL_DST_ALPHA;
+        case bm_inv_dest_alpha: return GL_ONE_MINUS_DST_ALPHA;
+        case bm_dest_color: return GL_DST_COLOR;
+        case bm_inv_dest_color: return GL_ONE_MINUS_DST_COLOR;
+        case bm_src_alpha_sat: return GL_SRC_ALPHA_SATURATE;
+    }
+    return GL_ONE;
+}
+
+static GLenum gmsBlendModeToGLEquation(int mode) {
+    switch (mode) {
+            case bm_normal:
+                return GL_FUNC_ADD;
+            case bm_add:
+                return GL_FUNC_ADD;
+            case bm_subtract:
+                return GL_FUNC_ADD;
+            case bm_reverse_subtract:
+                return GL_FUNC_REVERSE_SUBTRACT;
+            case bm_min:
+                return GL_MIN;
+            case bm_max:
+                return GL_FUNC_ADD;
+            default:
+                return GL_FUNC_ADD;
+    }
+}
+
+static GLenum gmsBlendModeToGLSFactor(int mode) {
+    switch (mode) {
+            case bm_normal:
+                return GL_SRC_ALPHA;
+            case bm_add:
+                return GL_SRC_ALPHA;
+            case bm_subtract:
+                return GL_ZERO;
+            case bm_reverse_subtract:
+                return GL_SRC_ALPHA;
+            case bm_min:
+                return GL_ONE;
+            case bm_max:
+                return GL_SRC_ALPHA;
+            default:
+                return gmsBlendModeToGL(mode);
+    }
+}
+
+static GLenum gmsBlendModeToGLDFactor(int mode) {
+    switch (mode) {
+            case bm_normal:
+                return GL_ONE_MINUS_SRC_ALPHA;
+            case bm_add:
+                return GL_ONE;
+            case bm_subtract:
+                return GL_ONE_MINUS_SRC_COLOR;
+            case bm_reverse_subtract:
+                return GL_ONE;
+            case bm_min:
+                return GL_ONE;
+            case bm_max:
+                return GL_ONE_MINUS_SRC_COLOR;
+            default:
+                return gmsBlendModeToGL(mode);
+    }
+}
+
+static void glGpuSetBlendMode(Renderer* renderer, int32_t mode) {
+    flushBatch((GLRenderer*)renderer);
+    glBlendEquation(
+        gmsBlendModeToGLEquation(mode)
+    );
+    glBlendFunc(
+        gmsBlendModeToGLSFactor(mode), 
+        gmsBlendModeToGLDFactor(mode)
+    );
+}
+
+static void glGpuSetBlendModeExt(Renderer* renderer, int32_t sfactor, int32_t dfactor) {
+    flushBatch((GLRenderer*)renderer);
+    glBlendFunc(
+        gmsBlendModeToGLSFactor(sfactor), 
+        gmsBlendModeToGLDFactor(dfactor)
+    );
+}
+
+static void glGpuSetBlendEnable(Renderer* renderer, bool enable) {
+    flushBatch((GLRenderer*)renderer);
+    enable ? glEnable(GL_BLEND) : glDisable(GL_BLEND);
+}
+
+static void glGpuSetAlphaTestEnable(Renderer* renderer, bool enable) {
+    GLRenderer* gl = (GLRenderer*) renderer;
+    if (gl->alphaTestEnable == enable) return;
+    flushBatch(gl);
+    gl->alphaTestEnable = enable;
+    glUseProgram(gl->shaderProgram);
+    glUniform1f(gl->uAlphaTestRef, enable ? gl->alphaTestRef : -1.0f);
+}
+
+static void glGpuSetAlphaTestRef(Renderer* renderer, uint8_t ref) {
+    GLRenderer* gl = (GLRenderer*) renderer;
+    float refF = ref / 255.0f;
+    if (gl->alphaTestRef == refF) return;
+    flushBatch(gl);
+    gl->alphaTestRef = refF;
+    if (gl->alphaTestEnable) {
+        glUseProgram(gl->shaderProgram);
+        glUniform1f(gl->uAlphaTestRef, refF);
+    }
+}
+
+static void glGpuSetColorWriteEnable(Renderer* renderer, bool red, bool green, bool blue, bool alpha) {
+    flushBatch((GLRenderer*)renderer);
+    glColorMask(red, green, blue, alpha);
+}
+
 // ===[ Vtable ]===
 
 static RendererVtable glVtable = {
@@ -2220,6 +2293,12 @@ static RendererVtable glVtable = {
     .flush = glRendererFlush,
     .createSpriteFromSurface = glCreateSpriteFromSurface,
     .deleteSprite = glDeleteSprite,
+    .gpuSetBlendMode = glGpuSetBlendMode,
+    .gpuSetBlendModeExt = glGpuSetBlendModeExt,
+    .gpuSetBlendEnable = glGpuSetBlendEnable,
+    .gpuSetAlphaTestEnable = glGpuSetAlphaTestEnable,
+    .gpuSetAlphaTestRef = glGpuSetAlphaTestRef,
+    .gpuSetColorWriteEnable = glGpuSetColorWriteEnable,
     .drawTile = nullptr,
     .createSurface = glCreateSurface,
     .surfaceExists = glSurfaceExists,

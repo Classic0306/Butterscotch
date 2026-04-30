@@ -1,5 +1,4 @@
 #include "gl_legacy_renderer.h"
-#include "common.h"
 #include "matrix_math.h"
 #include "text_utils.h"
 
@@ -14,13 +13,37 @@
 #include "utils.h"
 #include "image_decoder.h"
 
+// ===[ Helpers ]===
+static void glApplyViewport(GLLegacyRenderer* gl, int32_t x, int32_t y, int32_t w, int32_t h) {
+    int32_t effW, effH;
+    if ((gl->gameW * gl->windowH) / gl->gameH < gl->windowW) {
+        effW = (gl->gameW * gl->windowH) / gl->gameH;
+        effH = gl->windowH;
+    } else {
+        effW = gl->windowW;
+        effH = (gl->gameH * gl->windowW) / gl->gameW;
+    }
+    float scale = (float)effW / (float)gl->gameW;
+    int32_t offsetX = (gl->windowW - effW) / 2;
+    int32_t offsetY = (gl->windowH - effH) / 2;
+
+    int32_t vpX = offsetX + (int32_t)(x * scale);
+    int32_t vpY = offsetY + (int32_t)((gl->gameH - y - h) * scale);
+    int32_t vpW = (int32_t)(w * scale);
+    int32_t vpH = (int32_t)(h * scale);
+
+    glViewport(vpX, vpY, vpW, vpH);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(vpX, vpY, vpW, vpH);
+}
+
 // ===[ Vtable Implementations ]===
 
 static void glInit(Renderer* renderer, DataWin* dataWin) {
     GLLegacyRenderer* gl = (GLLegacyRenderer*) renderer;
     renderer->dataWin = dataWin;
 
-    // Load textures from TXTR pages
+    // Prepare texture slots for lazy loading (PNG decode deferred to first use)
     glEnable(GL_TEXTURE_2D);
     glDisable(GL_DEPTH_TEST);
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
@@ -71,19 +94,19 @@ static void glDestroy(Renderer* renderer) {
     free(gl->glTextures);
     free(gl->textureWidths);
     free(gl->textureHeights);
-    free(gl->textureLoaded);
     free(gl);
 }
 
 static void glBeginFrame(Renderer* renderer, int32_t gameW, int32_t gameH, int32_t windowW, int32_t windowH) {
     GLLegacyRenderer* gl = (GLLegacyRenderer*) renderer;
 
-    glBindTexture(GL_TEXTURE_2D, 0);
     gl->windowW = windowW;
     gl->windowH = windowH;
     gl->gameW = gameW;
     gl->gameH = gameH;
-
+    
+    glApplyViewport(gl, 0, 0, gameW, gameH);
+    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 static void glBeginView(Renderer* renderer, int32_t viewX, int32_t viewY, int32_t viewW, int32_t viewH, int32_t portX, int32_t portY, int32_t portW, int32_t portH, float viewAngle) {
@@ -94,10 +117,7 @@ static void glBeginView(Renderer* renderer, int32_t viewX, int32_t viewY, int32_
     // Set viewport and scissor to the port rectangle within the FBO
     // FBO uses game resolution, port coordinates are in game space
     // OpenGL viewport Y is bottom-up, game Y is top-down
-    int32_t glPortY = gl->gameH - portY - portH;
-    glViewport(portX, glPortY, gl->windowW, gl->windowH);
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(portX, glPortY, gl->windowW, gl->windowH);
+    glApplyViewport(gl, portX, portY, portW, portH);
 
     // Build orthographic projection (Y-down for GML coordinate system)
     Matrix4f projection;
@@ -136,10 +156,7 @@ static void glBeginGUI(Renderer* renderer, int32_t guiW, int32_t guiH, int32_t p
 
     glBindTexture(GL_TEXTURE_2D, 0);
 
-    int32_t glPortY = gl->gameH - portY - portH;
-    glViewport(portX, glPortY, portW, portH);
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(portX, glPortY, portW, portH);
+    glApplyViewport(gl, portX, portY, portW, portH);
 
     Matrix4f projection;
     Matrix4f_identity(&projection);
@@ -156,7 +173,26 @@ static void glEndGUI(MAYBE_UNUSED Renderer* renderer) {
     glDisable(GL_SCISSOR_TEST);
 }
 
-static void glEndFrame(MAYBE_UNUSED Renderer* renderer) {}
+static void glEndFrame(Renderer* renderer) {
+    GLLegacyRenderer* gl = (GLLegacyRenderer*) renderer;
+
+    int effectiveEndX, effectiveEndY;
+    int effectiveStartX, effectiveStartY;
+
+    // Try and match the "intended" aspect ratio as closely 
+    // as possible while still fitting on the screen
+    if ((gl->gameW * gl->windowH) / gl->gameH < gl->windowW) {
+        effectiveEndX = (gl->gameW * gl->windowH) / gl->gameH;
+        effectiveEndY = gl->windowH;
+    } else {
+        effectiveEndX = gl->windowW;
+        effectiveEndY = (gl->gameH * gl->windowW) / gl->gameW;
+    }
+    effectiveStartX = (gl->windowW - effectiveEndX) / 2;
+    effectiveStartY = (gl->windowH - effectiveEndY) / 2;
+    effectiveEndX += effectiveStartX;
+    effectiveEndY += effectiveStartY;
+}
 
 static void glRendererFlush(MAYBE_UNUSED Renderer* renderer) {}
 
@@ -180,7 +216,7 @@ static bool ensureTextureLoaded(GLLegacyRenderer* gl, uint32_t pageId) {
 
     gl->textureWidths[pageId] = w;
     gl->textureHeights[pageId] = h;
-
+    
     glBindTexture(GL_TEXTURE_2D, gl->glTextures[pageId]);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -207,6 +243,7 @@ static void glDrawSprite(Renderer* renderer, int32_t tpagIndex, float x, float y
     GLuint texId = gl->glTextures[pageId];
     int32_t texW = gl->textureWidths[pageId];
     int32_t texH = gl->textureHeights[pageId];
+
     glBindTexture(GL_TEXTURE_2D, texId);
 
     // Compute normalized UVs from TPAG source rect
@@ -263,7 +300,47 @@ static void glDrawSprite(Renderer* renderer, int32_t tpagIndex, float x, float y
     glEnd();
 }
 
-static void glDrawSpritePart(Renderer* renderer, int32_t tpagIndex, int32_t srcOffX, int32_t srcOffY, int32_t srcW, int32_t srcH, float x, float y, float xscale, float yscale, uint32_t color, float alpha) {
+static void glDrawSpritePos(Renderer* renderer, int32_t tpagIndex, float x1, float y1, float x2, float y2, float x3, float y3, float x4, float y4, float alpha) {
+    GLLegacyRenderer* gl = (GLLegacyRenderer*) renderer;
+    DataWin* dw = renderer->dataWin;
+
+    if (0 > tpagIndex || dw->tpag.count <= (uint32_t) tpagIndex) return;
+
+    TexturePageItem* tpag = &dw->tpag.items[tpagIndex];
+    int16_t pageId = tpag->texturePageId;
+    if (0 > pageId || gl->textureCount <= (uint32_t) pageId) return;
+    if (!ensureTextureLoaded(gl, (uint32_t) pageId)) return;
+
+    GLuint texId = gl->glTextures[pageId];
+    int32_t texW = gl->textureWidths[pageId];
+    int32_t texH = gl->textureHeights[pageId];
+    glBindTexture(GL_TEXTURE_2D, texId);
+
+    float u0 = (float) tpag->sourceX / (float) texW;
+    float v0 = (float) tpag->sourceY / (float) texH;
+    float u1 = (float) (tpag->sourceX + tpag->sourceWidth) / (float) texW;
+    float v1 = (float) (tpag->sourceY + tpag->sourceHeight) / (float) texH;
+
+    glBegin(GL_QUADS);
+        glColor4f(1.0f, 1.0f, 1.0f, alpha);
+        glTexCoord2f(u0, v0);
+        glVertex2f(x1, y1);
+
+        glColor4f(1.0f, 1.0f, 1.0f, alpha);
+        glTexCoord2f(u1, v0);
+        glVertex2f(x2, y2);
+
+        glColor4f(1.0f, 1.0f, 1.0f, alpha);
+        glTexCoord2f(u1, v1);
+        glVertex2f(x3, y3);
+
+        glColor4f(1.0f, 1.0f, 1.0f, alpha);
+        glTexCoord2f(u0, v1);
+        glVertex2f(x4, y4);
+    glEnd();
+}
+
+static void glDrawSpritePart(Renderer* renderer, int32_t tpagIndex, int32_t srcOffX, int32_t srcOffY, int32_t srcW, int32_t srcH, float x, float y, float xscale, float yscale, float angleDeg, float pivotX, float pivotY, uint32_t color, float alpha) {
     GLLegacyRenderer* gl = (GLLegacyRenderer*) renderer;
     DataWin* dw = renderer->dataWin;
 
@@ -278,7 +355,6 @@ static void glDrawSpritePart(Renderer* renderer, int32_t tpagIndex, int32_t srcO
     int32_t texW = gl->textureWidths[pageId];
     int32_t texH = gl->textureHeights[pageId];
 
-    // Flush if texture changed or batch full
     glBindTexture(GL_TEXTURE_2D, texId);
 
     // Compute UVs for the sub-region within the atlas
@@ -287,37 +363,45 @@ static void glDrawSpritePart(Renderer* renderer, int32_t tpagIndex, int32_t srcO
     float u1 = (float) (tpag->sourceX + srcOffX + srcW) / (float) texW;
     float v1 = (float) (tpag->sourceY + srcOffY + srcH) / (float) texH;
 
-    // Quad corners (no origin offset, no transform - draw_sprite_part ignores sprite origin)
-    float x0 = x;
-    float y0 = y;
-    float x1 = x + (float) srcW * xscale;
-    float y1 = y + (float) srcH * yscale;
-
     // Convert BGR color to RGB floats
     float r = (float) BGR_R(color) / 255.0f;
     float g = (float) BGR_G(color) / 255.0f;
     float b = (float) BGR_B(color) / 255.0f;
 
+    // Quad corners (no origin offset - draw_sprite_part ignores sprite origin)
+    float cx0, cy0, cx1, cy1, cx2, cy2, cx3, cy3;
+    if (angleDeg == 0.0f) {
+        cx0 = x;                         cy0 = y;
+        cx1 = x + (float) srcW * xscale; cy1 = y;
+        cx2 = x + (float) srcW * xscale; cy2 = y + (float) srcH * yscale;
+        cx3 = x;                         cy3 = y + (float) srcH * yscale;
+    } else {
+        float angleRad = -angleDeg * ((float) M_PI / 180.0f);
+        float cosA = cosf(angleRad);
+        float sinA = sinf(angleRad);
+        float qx0 = x,                         qy0 = y;
+        float qx1 = x + (float) srcW * xscale, qy1 = y;
+        float qx2 = x + (float) srcW * xscale, qy2 = y + (float) srcH * yscale;
+        float qx3 = x,                         qy3 = y + (float) srcH * yscale;
+        float dx, dy;
+        dx = qx0 - pivotX; dy = qy0 - pivotY; cx0 = cosA * dx - sinA * dy + pivotX; cy0 = sinA * dx + cosA * dy + pivotY;
+        dx = qx1 - pivotX; dy = qy1 - pivotY; cx1 = cosA * dx - sinA * dy + pivotX; cy1 = sinA * dx + cosA * dy + pivotY;
+        dx = qx2 - pivotX; dy = qy2 - pivotY; cx2 = cosA * dx - sinA * dy + pivotX; cy2 = sinA * dx + cosA * dy + pivotY;
+        dx = qx3 - pivotX; dy = qy3 - pivotY; cx3 = cosA * dx - sinA * dy + pivotX; cy3 = sinA * dx + cosA * dy + pivotY;
+    }
+
     glBegin(GL_QUADS);
-        // Vertex 0: top-left
         glColor4f(r, g, b, alpha);
-        glTexCoord2f(u0, v0);
-        glVertex2f(x0, y0);
+        glTexCoord2f(u0, v0); glVertex2f(cx0, cy0);
 
-        // Vertex 1: top-right
         glColor4f(r, g, b, alpha);
-        glTexCoord2f(u1, v0);
-        glVertex2f(x1, y0);
+        glTexCoord2f(u1, v0); glVertex2f(cx1, cy1);
 
-        // Vertex 2: bottom-right
         glColor4f(r, g, b, alpha);
-        glTexCoord2f(u1, v1);
-        glVertex2f(x1, y1);
+        glTexCoord2f(u1, v1); glVertex2f(cx2, cy2);
 
-        // Vertex 3: bottom-left
         glColor4f(r, g, b, alpha);
-        glTexCoord2f(u0, v1);
-        glVertex2f(x0, y1);
+        glTexCoord2f(u0, v1); glVertex2f(cx3, cy3);
     glEnd();
 }
 
@@ -433,6 +517,7 @@ static void glDrawLineColor(Renderer* renderer, float x1, float y1, float x2, fl
     float px = (-dy / len) * halfW;
     float py = (dx / len) * halfW;
 
+    // Emit quad with per-vertex colors (color1 at start, color2 at end)
     glBindTexture(GL_TEXTURE_2D, gl->whiteTexture);
 
     glBegin(GL_QUADS);
@@ -470,7 +555,7 @@ static void glDrawTriangle(Renderer *renderer, float x1, float y1, float x2, flo
         float r = (float) BGR_R(renderer->drawColor) / 255.0f;
         float g = (float) BGR_G(renderer->drawColor) / 255.0f;
         float b = (float) BGR_B(renderer->drawColor) / 255.0f;
-        
+
         glBindTexture(GL_TEXTURE_2D, gl->whiteTexture);
 
         glBegin(GL_TRIANGLES);
@@ -592,6 +677,8 @@ static void glDrawText(Renderer* renderer, const char* text, float x, float y, f
     // Count lines, treating \r\n and \n\r as single breaks
     int32_t lineCount = TextUtils_countLines(text, textLen);
 
+    // Per-line vertical stride. HTML5 runner's default `linesep` is `max_glyph_height * scaleY`.
+    // We apply scaleY via the transform matrix below, so keep the stride in pre-scale (local) coords.
     float lineStride = TextUtils_lineStride(font);
 
     // Vertical alignment offset
@@ -605,7 +692,8 @@ static void glDrawText(Renderer* renderer, const char* text, float x, float y, f
     Matrix4f transform;
     Matrix4f_setTransform2D(&transform, x, y, xscale * font->scaleX, yscale * font->scaleY, angleRad);
 
-    // Iterate through lines. HTML5 subtracts ascenderOffset from per-line y offset.
+    // Iterate through lines. HTML5 subtracts ascenderOffset from the per-line y offset
+    // (see yyFont.GR_Text_Draw), shifting glyphs up so the baseline aligns with the drawn y.
     float cursorY = valignOffset - (float) font->ascenderOffset;
     int32_t lineStart = 0;
 
@@ -946,6 +1034,7 @@ static int32_t glCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID, 
     gl->glTextures[pageId] = newTexId;
     gl->textureWidths[pageId] = w;
     gl->textureHeights[pageId] = h;
+    gl->textureLoaded[pageId] = true;
 
     uint32_t tpagIndex = findOrAllocTpagSlot(dw, gl->originalTpagCount);
     TexturePageItem* tpag = &dw->tpag.items[tpagIndex];
@@ -1018,6 +1107,113 @@ static void glDeleteSprite(Renderer* renderer, int32_t spriteIndex) {
     fprintf(stderr, "GL: Deleted sprite %d\n", spriteIndex);
 }
 
+static GLenum gmsBlendModeToGL(int mode) {
+    switch(mode) {    
+        case bm_zero: return GL_ZERO;
+        case bm_one: return GL_ONE;
+        case bm_src_color: return GL_SRC_COLOR;
+        case bm_inv_src_color: return GL_ONE_MINUS_SRC_COLOR;
+        case bm_src_alpha: return GL_SRC_ALPHA;
+        case bm_inv_src_alpha: return GL_ONE_MINUS_SRC_ALPHA;
+        case bm_dest_alpha: return GL_DST_ALPHA;
+        case bm_inv_dest_alpha: return GL_ONE_MINUS_DST_ALPHA;
+        case bm_dest_color: return GL_DST_COLOR;
+        case bm_inv_dest_color: return GL_ONE_MINUS_DST_COLOR;
+        case bm_src_alpha_sat: return GL_SRC_ALPHA_SATURATE;
+    }
+    return GL_ONE;
+}
+
+static GLenum gmsBlendModeToGLEquation(int mode) {
+    switch (mode) {
+            case bm_normal:
+                return GL_FUNC_ADD;
+            case bm_add:
+                return GL_FUNC_ADD;
+            case bm_subtract:
+                return GL_FUNC_ADD;
+            case bm_reverse_subtract:
+                return GL_FUNC_REVERSE_SUBTRACT;
+            case bm_min:
+                return GL_MIN;
+            case bm_max:
+                return GL_FUNC_ADD;
+            default:
+                return GL_FUNC_ADD;
+    }
+}
+
+static GLenum gmsBlendModeToGLSFactor(int mode) {
+    switch (mode) {
+            case bm_normal:
+                return GL_SRC_ALPHA;
+            case bm_add:
+                return GL_SRC_ALPHA;
+            case bm_subtract:
+                return GL_ZERO;
+            case bm_reverse_subtract:
+                return GL_SRC_ALPHA;
+            case bm_min:
+                return GL_ONE;
+            case bm_max:
+                return GL_SRC_ALPHA;
+            default:
+                return gmsBlendModeToGL(mode);
+    }
+}
+
+static GLenum gmsBlendModeToGLDFactor(int mode) {
+    switch (mode) {
+            case bm_normal:
+                return GL_ONE_MINUS_SRC_ALPHA;
+            case bm_add:
+                return GL_ONE;
+            case bm_subtract:
+                return GL_ONE_MINUS_SRC_COLOR;
+            case bm_reverse_subtract:
+                return GL_ONE;
+            case bm_min:
+                return GL_ONE;
+            case bm_max:
+                return GL_ONE_MINUS_SRC_COLOR;
+            default:
+                return gmsBlendModeToGL(mode);
+    }
+}
+
+static void glGpuSetBlendMode(Renderer* renderer, int32_t mode) {
+    glBlendEquation(
+        gmsBlendModeToGLEquation(mode)
+    );
+    glBlendFunc(
+        gmsBlendModeToGLSFactor(mode), 
+        gmsBlendModeToGLDFactor(mode)
+    );
+}
+
+static void glGpuSetBlendModeExt(Renderer* renderer, int32_t sfactor, int32_t dfactor) {
+    glBlendFunc(
+        gmsBlendModeToGLSFactor(sfactor), 
+        gmsBlendModeToGLDFactor(dfactor)
+    );
+}
+
+static void glGpuSetBlendEnable(Renderer* renderer, bool enable) {
+    enable ? glEnable(GL_BLEND) : glDisable(GL_BLEND);
+}
+
+static void glGpuSetAlphaTestEnable(Renderer* renderer, bool enable) {
+    enable ? glEnable(GL_ALPHA_TEST) : glDisable(GL_ALPHA_TEST);
+}
+
+static void glGpuSetAlphaTestRef(Renderer* renderer, uint8_t ref) {
+    glAlphaFunc(GL_GREATER, ref/255.0f);
+}
+
+static void glGpuSetColorWriteEnable(Renderer* renderer, bool red, bool green, bool blue, bool alpha) {
+    glColorMask(red, green, blue, alpha);
+}
+
 // ===[ Vtable ]===
 
 static RendererVtable glVtable = {
@@ -1030,6 +1226,7 @@ static RendererVtable glVtable = {
     .beginGUI = glBeginGUI,
     .endGUI = glEndGUI,
     .drawSprite = glDrawSprite,
+    .drawSpritePos = glDrawSpritePos,
     .drawSpritePart = glDrawSpritePart,
     .drawRectangle = glDrawRectangle,
     .drawLine = glDrawLine,
@@ -1040,6 +1237,12 @@ static RendererVtable glVtable = {
     .flush = glRendererFlush,
     .createSpriteFromSurface = glCreateSpriteFromSurface,
     .deleteSprite = glDeleteSprite,
+    .gpuSetBlendMode = glGpuSetBlendMode,
+    .gpuSetBlendModeExt = glGpuSetBlendModeExt,
+    .gpuSetBlendEnable = glGpuSetBlendEnable,
+    .gpuSetAlphaTestEnable = glGpuSetAlphaTestEnable,
+    .gpuSetAlphaTestRef = glGpuSetAlphaTestRef,
+    .gpuSetColorWriteEnable = glGpuSetColorWriteEnable,
     .drawTile = nullptr,
 };
 

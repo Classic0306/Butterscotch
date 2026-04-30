@@ -154,7 +154,7 @@ int32_t Runner_pushInstancesForTarget(Runner* runner, int32_t target) {
         return base;
     }
     if (target >= 100000) {
-        Instance* inst = hmget(runner->instancesToId, target);
+        Instance* inst = hmget(runner->instancesById, target);
         if (inst != nullptr) arrput(runner->instanceSnapshots, inst);
         return base;
     }
@@ -342,13 +342,9 @@ static bool eventUsesBC17PerObjectDispatch(int32_t eventType) {
     return eventType == EVENT_STEP || eventType == EVENT_ALARM || eventType == EVENT_KEYBOARD || eventType == EVENT_KEYPRESS || eventType == EVENT_KEYRELEASE;
 }
 
-static inline bool Runner_hasAnyObjectWithHandler(Runner* runner, int32_t type, int32_t subtype) {
-    return EventSlotMap_lookup(&runner->eventSlotMap, type, subtype) > 0;
-}
-
 void Runner_executeEventForAll(Runner* runner, int32_t eventType, int32_t eventSubtype) {
-    if (!Runner_hasAnyObjectWithHandler(runner, eventType, eventSubtype)) return;
     int32_t slot = EventSlotMap_lookup(&runner->eventSlotMap, eventType, eventSubtype);
+    if (slot == -1) return;
 
     // We always snapshot the iteration list before dispatching so instances spawned during this phase do NOT fire the current event.
     Instance** scratch = runner->eventDispatchInstances;
@@ -454,12 +450,17 @@ static int compareDrawableDepth(const void* a, const void* b) {
         if (db->tileIndex > da->tileIndex) return -1;
         if (da->tileIndex > db->tileIndex) return 1;
     }
+    // At same depth, newer instances (higher instanceId) draw FIRST (behind), older draw LAST (front).
+    if (da->type == DRAWABLE_INSTANCE && db->type == DRAWABLE_INSTANCE) {
+        if (db->instance->instanceId > da->instance->instanceId) return 1;
+        if (da->instance->instanceId > db->instance->instanceId) return -1;
+    }
     return 0;
 }
 
 static void fireDrawSubtype(Runner* runner, Drawable* drawables, int32_t drawableCount, int32_t subtype) {
-    if (!Runner_hasAnyObjectWithHandler(runner, EVENT_DRAW, subtype)) return;
     int32_t slot = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_DRAW, subtype);
+    if (slot == -1) return;
 
     repeat(drawableCount, i) {
         Drawable* d = &drawables[i];
@@ -532,7 +533,7 @@ static void Runner_drawTileLayer(Runner* runner, RoomLayerTilesData* data, float
             float dstX = (float) (tx * tileW) + layerOffsetX + (mirror ? (float) tileW : 0.0f);
             float dstY = (float) (ty * tileH) + layerOffsetY + (flip ? (float) tileH : 0.0f);
 
-            runner->renderer->vtable->drawSpritePart(runner->renderer, tpagIndex, srcX, srcY, (int32_t) tileW, (int32_t) tileH, dstX, dstY, xscale, yscale, 0xFFFFFF, 1.0f);
+            runner->renderer->vtable->drawSpritePart(runner->renderer, tpagIndex, srcX, srcY, (int32_t) tileW, (int32_t) tileH, dstX, dstY, xscale, yscale, 0.0f, 0.0f, 0.0f, 0xFFFFFF, 1.0f);
         }
     }
 }
@@ -853,14 +854,14 @@ static Instance* createAndInitInstance(Runner* runner, int32_t instanceId, int32
     inst->depth = objDef->depth;
     inst->maskIndex = objDef->textureMaskId;
 
-    hmput(runner->instancesToId, instanceId, inst);
+    hmput(runner->instancesById, instanceId, inst);
     arrput(runner->instances, inst);
     Runner_addInstanceToObjectLists(runner, inst);
     runner->drawableListStructureDirty = true;
 
 #ifdef ENABLE_VM_TRACING
     if (shgeti(runner->vmContext->instanceLifecyclesToBeTraced, "*") != -1 || shgeti(runner->vmContext->instanceLifecyclesToBeTraced, objDef->name) != -1) {
-        fprintf(stderr, "VM: Instance %s (%d) created at (%f, %f)\n", objDef->name, instanceId, x, y);
+        fprintf(stderr, "VM: Instance %s (instanceId=%d,objectIndex=%d) created at (%f, %f)\n", objDef->name, instanceId, inst->objectIndex, x, y);
     }
 #endif
 
@@ -880,7 +881,7 @@ static Instance** takePersistentInstances(Runner* runner) {
 #ifdef ENABLE_VM_TRACING
             GameObject* gameObject = &runner->dataWin->objt.objects[inst->objectIndex];
             if (shgeti(runner->vmContext->instanceLifecyclesToBeTraced, "*") != -1 || shgeti(runner->vmContext->instanceLifecyclesToBeTraced, gameObject->name) != -1) {
-                fprintf(stderr, "VM: Instance %s (%d) has been persisted at (%f, %f) due to room change\n", gameObject->name, inst->instanceId, inst->x, inst->y);
+                fprintf(stderr, "VM: Instance %s (instanceId=%d,objectIndex=%d) has been persisted at (%f, %f) due to room change\n", gameObject->name, inst->instanceId, inst->objectIndex, inst->x, inst->y);
             }
 #endif
 
@@ -889,11 +890,11 @@ static Instance** takePersistentInstances(Runner* runner) {
 #ifdef ENABLE_VM_TRACING
             GameObject* gameObject = &runner->dataWin->objt.objects[inst->objectIndex];
             if (shgeti(runner->vmContext->instanceLifecyclesToBeTraced, "*") != -1 || shgeti(runner->vmContext->instanceLifecyclesToBeTraced, gameObject->name) != -1) {
-                fprintf(stderr, "VM: Instance %s (%d) destroyed at (%f, %f) due to room change\n", gameObject->name, inst->instanceId, inst->x, inst->y);
+                fprintf(stderr, "VM: Instance %s (instanceId=%d,objectIndex=%d) destroyed at (%f, %f) due to room change\n", gameObject->name, inst->instanceId, inst->objectIndex, inst->x, inst->y);
             }
 #endif
 
-            hmdel(runner->instancesToId, inst->instanceId);
+            hmdel(runner->instancesById, inst->instanceId);
             Instance_free(inst);
         }
     }
@@ -1100,7 +1101,7 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
         RoomGameObject* roomObj = &room->gameObjects[i];
 
         // Skip if a persistent instance carried over from the previous room already owns this ID (re-entering the persistent instance's home room, don't create a duplicate!).
-        if (hmget(runner->instancesToId, roomObj->instanceID) != nullptr) continue;
+        if (hmget(runner->instancesById, roomObj->instanceID) != nullptr) continue;
         if (isObjectDisabled(runner, roomObj->objectDefinition)) continue;
 
         Instance* inst = createAndInitInstance(runner, roomObj->instanceID, roomObj->objectDefinition, (GMLReal) roomObj->x, (GMLReal) roomObj->y);
@@ -1119,7 +1120,7 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
             if (layer->type != RoomLayerType_Instances || layer->instancesData == nullptr) continue;
             RoomLayerInstancesData* layerData = layer->instancesData;
             repeat(layerData->instanceCount, ii) {
-                Instance* inst = hmget(runner->instancesToId, layerData->instanceIds[ii]);
+                Instance* inst = hmget(runner->instancesById, layerData->instanceIds[ii]);
                 if (inst != nullptr) {
                     inst->depth = layer->depth;
                 }
@@ -1135,11 +1136,11 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
     repeat(room->gameObjectCount, i) {
         RoomGameObject* roomObj = &room->gameObjects[i];
 
-        Instance* inst = hmget(runner->instancesToId, roomObj->instanceID);
+        Instance* inst = hmget(runner->instancesById, roomObj->instanceID);
         if (inst == nullptr) continue;
 
         // Skip instances that already had their Create event fired (persistent carry-overs
-        // that hmget also matches, since instancesToId still holds them).
+        // that hmget also matches, since instancesById still holds them).
         if (inst->createEventFired) continue;
         inst->createEventFired = true;
 
@@ -1168,9 +1169,14 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
 
 // Cleans up the runner state, used when freeing the Runner or when restarting the Runner
 static void cleanupState(Runner* runner) {
+    // Drop VM-side RValue holders (globals, stack, call frames) BEFORE freeing any Instance memory. This way any RVALUE_STRUCT refs decrement against still-live struct memory; otherwise we'd free a struct here and then have VM_free's later VM_reset try to decRef a dangling pointer.
+    if (runner->vmContext != nullptr) {
+        VM_reset(runner->vmContext);
+    }
+
     // Free all instances
     repeat(arrlen(runner->instances), i) {
-        hmdel(runner->instancesToId, runner->instances[i]->instanceId);
+        hmdel(runner->instancesById, runner->instances[i]->instanceId);
         Instance_free(runner->instances[i]);
     }
     arrfree(runner->instances);
@@ -1185,7 +1191,7 @@ static void cleanupState(Runner* runner) {
             SavedRoomState* state = &runner->savedRoomStates[i];
             int32_t savedCount = (int32_t) arrlen(state->instances);
             repeat(savedCount, j) {
-                hmdel(runner->instancesToId, state->instances[j]->instanceId);
+                hmdel(runner->instancesById, state->instances[j]->instanceId);
                 Instance_free(state->instances[j]);
             }
             arrfree(state->instances);
@@ -1196,16 +1202,18 @@ static void cleanupState(Runner* runner) {
     }
     runner->savedRoomStates = nullptr;
 
-    // Free struct instances (created via @@NewGMLObject@@)
+    // Free struct instances (created via @@NewGMLObject@@). Anything still here at shutdown is leaked refs or a reference cycle - bulk free regardless of refCount.
     repeat(arrlen(runner->structInstances), i) {
-        hmdel(runner->instancesToId, runner->structInstances[i]->instanceId);
-        Instance_free(runner->structInstances[i]);
+        Instance* s = runner->structInstances[i];
+        hmdel(runner->instancesById, s->instanceId);
+        s->structRegistryIndex = -1;
+        Instance_free(s);
     }
     arrfree(runner->structInstances);
     runner->structInstances = nullptr;
 
-    hmfree(runner->instancesToId);
-    runner->instancesToId = nullptr;
+    hmfree(runner->instancesById);
+    runner->instancesById = nullptr;
     hmfree(runner->tileLayerMap);
     runner->tileLayerMap = nullptr;
     freeRuntimeLayersArray(&runner->runtimeLayers);
@@ -1269,8 +1277,10 @@ static void cleanupState(Runner* runner) {
         }
     }
 
-    if (runner->spatialGrid != nullptr)
+    if (runner->spatialGrid != nullptr) {
         SpatialGrid_free(runner->spatialGrid);
+        runner->spatialGrid = nullptr;
+    }
 }
 
 // ===[ Public API ]===
@@ -1368,6 +1378,9 @@ Runner* Runner_create(DataWin* dataWin, VMContext* vm, Renderer* renderer, FileS
     runner->keyboard = RunnerKeyboard_create();
     runner->gamepads = RunnerGamepad_create();
 
+    // Collision compatibility mode is "enabled" for all pre-GM 2022.1 games AND for any post-GM 2022.1 games that have the bit 27 set
+    runner->collisionCompatibilityMode = (dataWin->detectedFormat.major == 1) || (((dataWin->optn.info >> 27) & 1) != 0);
+
     // Build the event dispatch acceleration tables.
     EventSlotMap_build(&runner->eventSlotMap, dataWin);
     ResolvedEventTable_build(&runner->eventTable, dataWin, &runner->eventSlotMap);
@@ -1431,7 +1444,7 @@ void Runner_destroyInstance(MAYBE_UNUSED Runner* runner, Instance* inst) {
 #ifdef ENABLE_VM_TRACING
     GameObject* gameObject = &runner->dataWin->objt.objects[inst->objectIndex];
     if (shgeti(runner->vmContext->instanceLifecyclesToBeTraced, "*") != -1 || shgeti(runner->vmContext->instanceLifecyclesToBeTraced, gameObject->name) != -1) {
-        fprintf(stderr, "VM: Instance %s (%d) destroyed\n", gameObject->name, inst->instanceId);
+        fprintf(stderr, "VM: Instance %s (instanceId=%d,objectIndex=%d) destroyed\n", gameObject->name, inst->instanceId, inst->objectIndex);
     }
 #endif
 }
@@ -1475,6 +1488,33 @@ uint32_t Runner_getNextLayerId(Runner* runner) {
     return runner->nextLayerId++;
 }
 
+// Reaps GML structs whose only remaining ref is the structInstances registry's implicit +1.
+// Walks backward so that swap-remove of dead entries doesn't disturb the indexes of entries we haven't visited yet.
+static void Runner_sweepDeadStructs(Runner* runner) {
+    int32_t count = (int32_t) arrlen(runner->structInstances);
+    for (int32_t i = count - 1; i >= 0; i--) {
+        Instance* s = runner->structInstances[i];
+        if (s->refCount > 1) continue; // still referenced by user code
+        require(s->refCount == 1);
+
+        // Remove from runner->instancesById so future findInstanceByTarget(id) returns nullptr.
+        hmdel(runner->instancesById, s->instanceId);
+
+        // O(1) swap-remove from structInstances, keeping structRegistryIndex in sync.
+        int32_t lastIdx = (int32_t) arrlen(runner->structInstances) - 1;
+        if (i != lastIdx) {
+            Instance* moved = runner->structInstances[lastIdx];
+            runner->structInstances[i] = moved;
+            moved->structRegistryIndex = i;
+        }
+        arrpop(runner->structInstances);
+
+        s->structRegistryIndex = -1;
+        s->refCount = 0; // drop the registry's ref; we are about to free
+        Instance_free(s);
+    }
+}
+
 void Runner_cleanupDestroyedInstances(Runner* runner) {
     int32_t count = (int32_t) arrlen(runner->instances);
     int32_t writeIdx = 0;
@@ -1484,7 +1524,7 @@ void Runner_cleanupDestroyedInstances(Runner* runner) {
             runner->instances[writeIdx++] = inst;
         } else {
             Runner_removeInstanceFromObjectLists(runner, inst);
-            hmdel(runner->instancesToId, inst->instanceId);
+            hmdel(runner->instancesById, inst->instanceId);
             Instance_free(inst);
             // Cached drawables hold raw Instance* that we just freed; force a rebuild before the next draw.
             runner->drawableListStructureDirty = true;
@@ -1564,6 +1604,123 @@ static void executeCollisionEvent(Runner* runner, Instance* self, Instance* othe
     vm->otherInstance = savedOtherInstance;
 }
 
+// ===[ Path Adaptation ]===
+// Advances path position and updates instance x/y (HTML5: yyInstance.js Adapt_Path, lines 2755-2881)
+// Returns true if end of path was reached (and pathSpeed != 0), to fire OTHER_END_OF_PATH event.
+static bool adaptPath(Runner* runner, Instance* inst) {
+    if (0 > inst->pathIndex) return false;
+
+    DataWin* dataWin = runner->dataWin;
+    if ((uint32_t) inst->pathIndex >= dataWin->path.count) return false;
+
+    GamePath* path = &dataWin->path.paths[inst->pathIndex];
+    if (0.0 >= path->length) return false;
+
+    bool atPathEnd = false;
+
+    GMLReal orient = inst->pathOrientation * M_PI / 180.0;
+
+    // Get current position's speed factor
+    PathPositionResult cur = GamePath_getPosition(path, inst->pathPosition);
+    GMLReal sp = cur.speed / (100.0 * inst->pathScale);
+
+    // Advance position (compute in higher precision, truncate to float on store - matches native runner)
+    inst->pathPosition = (float) (inst->pathPosition + inst->pathSpeed * sp / path->length);
+
+    // Handle end actions if position out of [0,1]
+    PathPositionResult pos0 = GamePath_getPosition(path, 0.0f);
+    if (inst->pathPosition >= 1.0f || 0.0f >= inst->pathPosition) {
+        atPathEnd = (inst->pathSpeed == 0.0f) ? false : true;
+
+        switch (inst->pathEndAction) {
+            // stop moving
+            case 0: {
+                if (inst->pathSpeed >= 0.0f) {
+                    if (inst->pathSpeed != 0.0f) {
+                        inst->pathPosition = 1.0f;
+                        inst->pathIndex = -1;
+                    }
+                } else {
+                    inst->pathPosition = 0.0f;
+                    inst->pathIndex = -1;
+                }
+                break;
+            }
+            // continue from start position (restart)
+            case 1: {
+                if (0.0f > inst->pathPosition) {
+                    inst->pathPosition += 1.0f;
+                } else {
+                    inst->pathPosition -= 1.0f;
+                }
+                break;
+            }
+            // continue from current position
+            case 2: {
+                PathPositionResult pos1 = GamePath_getPosition(path, 1.0f);
+                GMLReal xx = pos1.x - pos0.x;
+                GMLReal yy = pos1.y - pos0.y;
+                GMLReal xdif = inst->pathScale * (xx * GMLReal_cos(orient) + yy * GMLReal_sin(orient));
+                GMLReal ydif = inst->pathScale * (yy * GMLReal_cos(orient) - xx * GMLReal_sin(orient));
+
+                if (0.0f > inst->pathPosition) {
+                    inst->pathXStart -= (float) xdif;
+                    inst->pathYStart -= (float) ydif;
+                    inst->pathPosition += 1.0f;
+                } else {
+                    inst->pathXStart += (float) xdif;
+                    inst->pathYStart += (float) ydif;
+                    inst->pathPosition -= 1.0f;
+                }
+                break;
+            }
+            // reverse
+            case 3: {
+                if (0.0f > inst->pathPosition) {
+                    inst->pathPosition = -inst->pathPosition;
+                    inst->pathSpeed = (float) GMLReal_fabs(inst->pathSpeed);
+                } else {
+                    inst->pathPosition = 2.0f - inst->pathPosition;
+                    inst->pathSpeed = (float) -GMLReal_fabs(inst->pathSpeed);
+                }
+                break;
+            }
+            // default: stop
+            default: {
+                inst->pathPosition = 1.0f;
+                inst->pathIndex = -1;
+                break;
+            }
+        }
+    }
+
+    // Find the new position in the room
+    PathPositionResult newPos = GamePath_getPosition(path, inst->pathPosition);
+    GMLReal xx = newPos.x - pos0.x; // relative
+    GMLReal yy = newPos.y - pos0.y;
+
+    GMLReal newx = inst->pathXStart + inst->pathScale * (xx * GMLReal_cos(orient) + yy * GMLReal_sin(orient));
+    GMLReal newy = inst->pathYStart + inst->pathScale * (yy * GMLReal_cos(orient) - xx * GMLReal_sin(orient));
+
+    // Trick to set the direction: set hspeed/vspeed to delta, which updates direction
+    inst->hspeed = (float) (newx - inst->x);
+    inst->vspeed = (float) (newy - inst->y);
+    Instance_computeSpeedFromComponents(inst);
+
+    // Normal speed should not be used
+    inst->speed = 0.0f;
+    inst->hspeed = 0.0f;
+    inst->vspeed = 0.0f;
+
+    // Set the new position
+    inst->x = (float) newx;
+    inst->y = (float) newy;
+
+    SpatialGrid_markInstanceAsDirty(runner->spatialGrid, inst);
+
+    return atPathEnd;
+}
+
 static void dispatchCollisionEvents(Runner* runner) {
     DataWin* dataWin = runner->dataWin;
     // Iterate only the objects that have any collision event in their parent chain.
@@ -1629,15 +1786,18 @@ static void dispatchCollisionEvents(Runner* runner) {
                     bool needsPrecise = (sprSelf != nullptr && sprSelf->sepMasks == 1) || (sprOther != nullptr && sprOther->sepMasks == 1);
 
                     if (needsPrecise) {
-                        if (!Collision_instancesOverlapPrecise(dataWin, self, other, bboxSelf, bboxOther)) continue;
+                        if (!Collision_instancesOverlapPrecise(dataWin, runner->collisionCompatibilityMode, self, other, bboxSelf, bboxOther)) continue;
                     }
 
-                    // Collision detected! If either instance is solid, restore both to xprevious/yprevious
-                    if (self->solid || other->solid) {
+                    // Collision detected! If either instance is solid, restore both to xprevious/yprevious.
+                    bool hadSolid = self->solid || other->solid;
+                    if (hadSolid) {
                         self->x = self->xprevious;
                         self->y = self->yprevious;
+                        if (self->pathIndex >= 0) self->pathPosition = self->pathPositionPrevious;
                         other->x = other->xprevious;
                         other->y = other->yprevious;
+                        if (other->pathIndex >= 0) other->pathPosition = other->pathPositionPrevious;
                         SpatialGrid_markInstanceAsDirty(runner->spatialGrid, self);
                         SpatialGrid_markInstanceAsDirty(runner->spatialGrid, other);
                     }
@@ -1646,6 +1806,24 @@ static void dispatchCollisionEvents(Runner* runner) {
                     // And if it DOES move via GML, the variable write handlers will set it to dirty
 
                     executeCollisionEvent(runner, self, other, targetObjIndex);
+
+                    // Native parity for solids: collision event can alter path state, so run one
+                    // post-event path adaptation and apply its hspeed/vspeed step.
+                    if (hadSolid && self->active && other->active) {
+                        adaptPath(runner, self);
+                        adaptPath(runner, other);
+                        if (self->hspeed != 0.0f || self->vspeed != 0.0f) {
+                            self->x += self->hspeed;
+                            self->y += self->vspeed;
+                            SpatialGrid_markInstanceAsDirty(runner->spatialGrid, self);
+                        }
+                        if (other->hspeed != 0.0f || other->vspeed != 0.0f) {
+                            other->x += other->hspeed;
+                            other->y += other->vspeed;
+                            SpatialGrid_markInstanceAsDirty(runner->spatialGrid, other);
+                        }
+                    }
+
                     // The collision event may have moved our instance, so we'll need to regenerate our self attributes!
                     selfDirty = true;
                 }
@@ -1770,130 +1948,13 @@ static void dispatchOutsideRoomEvents(Runner* runner) {
     }
 }
 
-// ===[ Path Adaptation ]===
-// Advances path position and updates instance x/y (HTML5: yyInstance.js Adapt_Path, lines 2755-2881)
-// Returns true if end of path was reached (and pathSpeed != 0), to fire OTHER_END_OF_PATH event.
-static bool adaptPath(Runner* runner, Instance* inst) {
-    if (0 > inst->pathIndex) return false;
-
-    DataWin* dataWin = runner->dataWin;
-    if ((uint32_t) inst->pathIndex >= dataWin->path.count) return false;
-
-    GamePath* path = &dataWin->path.paths[inst->pathIndex];
-    if (0.0 >= path->length) return false;
-
-    bool atPathEnd = false;
-
-    GMLReal orient = inst->pathOrientation * M_PI / 180.0;
-
-    // Get current position's speed factor
-    PathPositionResult cur = GamePath_getPosition(path, inst->pathPosition);
-    GMLReal sp = cur.speed / (100.0 * inst->pathScale);
-
-    // Advance position (compute in higher precision, truncate to float on store - matches native runner)
-    inst->pathPosition = (float) (inst->pathPosition + inst->pathSpeed * sp / path->length);
-
-    // Handle end actions if position out of [0,1]
-    PathPositionResult pos0 = GamePath_getPosition(path, 0.0f);
-    if (inst->pathPosition >= 1.0f || 0.0f >= inst->pathPosition) {
-        atPathEnd = (inst->pathSpeed == 0.0f) ? false : true;
-
-        switch (inst->pathEndAction) {
-            // stop moving
-            case 0: {
-                if (inst->pathSpeed >= 0.0f) {
-                    if (inst->pathSpeed != 0.0f) {
-                        inst->pathPosition = 1.0f;
-                        inst->pathIndex = -1;
-                    }
-                } else {
-                    inst->pathPosition = 0.0f;
-                    inst->pathIndex = -1;
-                }
-                break;
-            }
-            // continue from start position (restart)
-            case 1: {
-                if (0.0f > inst->pathPosition) {
-                    inst->pathPosition += 1.0f;
-                } else {
-                    inst->pathPosition -= 1.0f;
-                }
-                break;
-            }
-            // continue from current position
-            case 2: {
-                PathPositionResult pos1 = GamePath_getPosition(path, 1.0f);
-                GMLReal xx = pos1.x - pos0.x;
-                GMLReal yy = pos1.y - pos0.y;
-                GMLReal xdif = inst->pathScale * (xx * GMLReal_cos(orient) + yy * GMLReal_sin(orient));
-                GMLReal ydif = inst->pathScale * (yy * GMLReal_cos(orient) - xx * GMLReal_sin(orient));
-
-                if (0.0f > inst->pathPosition) {
-                    inst->pathXStart -= (float) xdif;
-                    inst->pathYStart -= (float) ydif;
-                    inst->pathPosition += 1.0f;
-                } else {
-                    inst->pathXStart += (float) xdif;
-                    inst->pathYStart += (float) ydif;
-                    inst->pathPosition -= 1.0f;
-                }
-                break;
-            }
-            // reverse
-            case 3: {
-                if (0.0f > inst->pathPosition) {
-                    inst->pathPosition = -inst->pathPosition;
-                    inst->pathSpeed = (float) GMLReal_fabs(inst->pathSpeed);
-                } else {
-                    inst->pathPosition = 2.0f - inst->pathPosition;
-                    inst->pathSpeed = (float) -GMLReal_fabs(inst->pathSpeed);
-                }
-                break;
-            }
-            // default: stop
-            default: {
-                inst->pathPosition = 1.0f;
-                inst->pathIndex = -1;
-                break;
-            }
-        }
-    }
-
-    // Find the new position in the room
-    PathPositionResult newPos = GamePath_getPosition(path, inst->pathPosition);
-    GMLReal xx = newPos.x - pos0.x; // relative
-    GMLReal yy = newPos.y - pos0.y;
-
-    GMLReal newx = inst->pathXStart + inst->pathScale * (xx * GMLReal_cos(orient) + yy * GMLReal_sin(orient));
-    GMLReal newy = inst->pathYStart + inst->pathScale * (yy * GMLReal_cos(orient) - xx * GMLReal_sin(orient));
-
-    // Trick to set the direction: set hspeed/vspeed to delta, which updates direction
-    inst->hspeed = (float) (newx - inst->x);
-    inst->vspeed = (float) (newy - inst->y);
-    Instance_computeSpeedFromComponents(inst);
-
-    // Normal speed should not be used
-    inst->speed = 0.0f;
-    inst->hspeed = 0.0f;
-    inst->vspeed = 0.0f;
-
-    // Set the new position
-    inst->x = (float) newx;
-    inst->y = (float) newy;
-
-    SpatialGrid_markInstanceAsDirty(runner->spatialGrid, inst);
-
-    return atPathEnd;
-}
-
 static void persistRoomState(Runner* runner, int32_t roomIndex) {
     SavedRoomState* state = &runner->savedRoomStates[roomIndex];
 
     // Free any previously saved instances (from an earlier visit)
     int32_t prevSavedCount = (int32_t) arrlen(state->instances);
     repeat(prevSavedCount, i) {
-        hmdel(runner->instancesToId, state->instances[i]->instanceId);
+        hmdel(runner->instancesById, state->instances[i]->instanceId);
         Instance_free(state->instances[i]);
     }
     arrfree(state->instances);
@@ -1912,7 +1973,7 @@ static void persistRoomState(Runner* runner, int32_t roomIndex) {
         } else if (inst->active) {
             arrput(state->instances, inst);
         } else {
-            hmdel(runner->instancesToId, inst->instanceId);
+            hmdel(runner->instancesById, inst->instanceId);
             Instance_free(inst);
         }
     }
@@ -2205,6 +2266,7 @@ void Runner_step(Runner* runner) {
     }
 
     Runner_cleanupDestroyedInstances(runner);
+    Runner_sweepDeadStructs(runner);
 
     runner->frameCount++;
 }
@@ -2373,6 +2435,12 @@ static void writeRValueJson(JsonWriter* w, RValue val) {
             break;
         }
 #endif
+        case RVALUE_STRUCT: {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "<struct:%u>", val.structInst != nullptr ? val.structInst->instanceId : 0);
+            JsonWriter_string(w, buf);
+            break;
+        }
     }
 }
 

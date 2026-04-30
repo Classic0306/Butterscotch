@@ -17,9 +17,10 @@ typedef struct {
     GLuint shaderProgram;
     GLint uProjection;
     GLint uTexture;
-    GLint uAlphaRef;
+    GLint uAlphaTestRef;
 
-    //Matrix4f previousViewMatix;
+    bool alphaTestEnable;
+    float alphaTestRef;
 
     GLuint vao, vbo, ebo;
     float* vertexData; // MAX_QUADS * VERTICES_PER_QUAD * FLOATS_PER_VERTEX floats

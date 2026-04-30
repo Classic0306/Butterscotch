@@ -233,7 +233,7 @@ static uint32_t resolveFuncOperand(const uint8_t* extraData) {
 // All arrays live as RVALUE_ARRAY (GMLArray*) inside a scalar variable slot (self vars, global vars, or local vars).
 // Variable reads return the RValue (which may be an array pointer) and variable writes update the slot directly.
 //
-// Reads return a weak view of the slot value - callers must incRef + set ownsString if they want to retain it.
+// Reads return a weak view of the slot value - callers must incRef + set ownsReference if they want to retain it.
 //
 // Writes (VARTYPE_ARRAY Pop, BREAK_POPAF, BREAK_PUSHAC materialisation) go through VM_arrayWriteAt,
 // which handles:
@@ -256,7 +256,7 @@ static RValue VM_arrayReadAt(RValue* slot, int32_t index) {
         return (RValue){ .type = RVALUE_UNDEFINED };
     }
     RValue result = *cell;
-    result.ownsString = false;
+    result.ownsReference = false;
     return result;
 }
 
@@ -268,16 +268,20 @@ static void storeIntoArraySlot(RValue* slot, RValue val) {
         *slot = RValue_makeOwnedString(safeStrdup(val.string));
     } else if (val.type == RVALUE_ARRAY && val.array != nullptr) {
         GMLArray_incRef(val.array);
-        val.ownsString = true;
+        val.ownsReference = true;
         *slot = val;
 #if IS_BC17_OR_HIGHER_ENABLED
     } else if (val.type == RVALUE_METHOD && val.method != nullptr) {
         GMLMethod_incRef(val.method);
-        val.ownsString = true;
+        val.ownsReference = true;
         *slot = val;
 #endif
+    } else if (val.type == RVALUE_STRUCT && val.structInst != nullptr) {
+        Instance_structIncRef(val.structInst);
+        val.ownsReference = true;
+        *slot = val;
     } else {
-        val.ownsString = false;
+        val.ownsReference = false;
         *slot = val;
     }
 }
@@ -323,7 +327,7 @@ static GMLArray* VM_arrayWriteAt(VMContext* ctx, RValue* slot, int32_t index, RV
         GMLArray* clone = GMLArray_clone(arr, intendedOwner);
         GMLArray_decRef(arr);
         slot->array = clone;
-        slot->ownsString = true;
+        slot->ownsReference = true;
         arr = clone;
     } else if (arr->owner == nullptr) {
         // Claim ownership on first write to an unowned array (e.g. freshly allocated by a builtin).
@@ -503,7 +507,7 @@ static Instance* findInstanceByTarget(VMContext* ctx, int32_t target) {
 
     if (target >= 100000) {
         // Instance ID - find specific instance
-        return hmget(runner->instancesToId, target);
+        return hmget(runner->instancesById, target);
     }
 
     // Object index - find first active matching instance via the descendant-inclusive bucket. Pure read, no user code, so we walk the bucket directly without an arena snapshot.
@@ -517,9 +521,46 @@ static Instance* findInstanceByTarget(VMContext* ctx, int32_t target) {
     return nullptr;
 }
 
+// Inline read of a non-array, non-builtin variable from a simple scope.
+// Returns false when the instanceType isn't covered or the scope's instance pointer is unavailable, so the caller can fall through to the full resolveVariableRead.
+// Used by the OP_PUSH/PUSHLOC/PUSHGLB fast paths in executeLoop to skip the entire resolveVariableRead dispatch overhead.
+static inline bool tryFastVarRead(VMContext* ctx, int32_t instanceType, Variable* varDef, RValue* out) {
+    switch (instanceType) {
+        case INSTANCE_SELF: {
+            Instance* inst = (Instance*) ctx->currentInstance;
+            if (inst == nullptr) return false;
+            RValue* slot = IntRValueHashMap_findSlot(&inst->selfVars, varDef->varID);
+            *out = (slot != nullptr) ? *slot : (RValue){ .type = RVALUE_UNDEFINED };
+            out->ownsReference = false;
+            return true;
+        }
+        case INSTANCE_LOCAL: {
+            uint32_t localSlot = resolveLocalSlot(ctx, varDef->varID);
+            require(ctx->localVarCount > localSlot);
+            *out = ctx->localVars[localSlot];
+            out->ownsReference = false;
+            return true;
+        }
+        case INSTANCE_GLOBAL: {
+            require(ctx->globalVarCount > (uint32_t) varDef->varID);
+            *out = ctx->globalVars[varDef->varID];
+            out->ownsReference = false;
+            return true;
+        }
+        case INSTANCE_OTHER: {
+            Instance* inst = (Instance*) ctx->otherInstance;
+            if (inst == nullptr) return false;
+            RValue* slot = IntRValueHashMap_findSlot(&inst->selfVars, varDef->varID);
+            *out = (slot != nullptr) ? *slot : (RValue){ .type = RVALUE_UNDEFINED };
+            out->ownsReference = false;
+            return true;
+        }
+    }
+    return false;
+}
+
 static RValue resolveVariableRead(VMContext* ctx, int32_t instanceType, uint32_t varRef) {
     Variable* varDef = resolveVarDef(ctx, varRef);
-
     ArrayAccess access = popArrayAccess(ctx, varRef);
 
     // Use instance type from stack when available (VARTYPE_ARRAY / VARTYPE_STACKTOP)
@@ -565,7 +606,7 @@ static RValue resolveVariableRead(VMContext* ctx, int32_t instanceType, uint32_t
             int32_t idx = access.arrayIndex;
             if (ctx->scriptArgs != nullptr && ctx->scriptArgCount > idx && idx >= 0) {
                 result = ctx->scriptArgs[idx];
-                result.ownsString = false;
+                result.ownsReference = false;
             } else {
                 result = RValue_makeUndefined();
             }
@@ -573,7 +614,7 @@ static RValue resolveVariableRead(VMContext* ctx, int32_t instanceType, uint32_t
             int32_t argIndex = bid - BUILTIN_VAR_ARGUMENT0;
             if (ctx->scriptArgs != nullptr && ctx->scriptArgCount > argIndex) {
                 result = ctx->scriptArgs[argIndex];
-                result.ownsString = false;
+                result.ownsReference = false;
                 // If we are trying to access the argument via an array (example: argName[i]), we NEED to read INSIDE the array
                 // Example:
                 // function init(arg2) {
@@ -607,26 +648,26 @@ static RValue resolveVariableRead(VMContext* ctx, int32_t instanceType, uint32_t
                 RValue* peekSlot = IntRValueHashMap_findSlot(&peekInst->selfVars, varDef->varID);
                 if (peekSlot != nullptr) {
                     RValue val = *peekSlot;
-                    val.ownsString = false;
+                    val.ownsReference = false;
                     return val;
                 }
             }
         }
 
         // Then try user scripts/code entries (funcMap maps both "funcName" and "gml_Script_funcName")
-        ptrdiff_t mapIdx = shgeti(ctx->funcMap, varDef->name);
+        ptrdiff_t mapIdx = shgeti(ctx->codeIndexByName, varDef->name);
         if (mapIdx >= 0) {
-            int32_t codeIndex = ctx->funcMap[mapIdx].value;
+            int32_t codeIndex = ctx->codeIndexByName[mapIdx].value;
             return RValue_makeMethod(codeIndex, -1);
         }
         // Then try registered built-ins
         ptrdiff_t bidx = shgeti(ctx->builtinMap, (char*) varDef->name);
         if (bidx >= 0) {
             BuiltinFunc bf = ctx->builtinMap[bidx].value;
-            return (RValue){ .method = GMLMethod_createBuiltin(bf, -1), .type = RVALUE_METHOD, .ownsString = true, .gmlStackType = GML_TYPE_VARIABLE };
+            return (RValue){ .method = GMLMethod_createBuiltin(bf, -1), .type = RVALUE_METHOD, .ownsReference = true, .gmlStackType = GML_TYPE_VARIABLE };
         }
         // Unresolved: return a method stub so CallV can log a single "unknown function" and return undefined instead of bailing out with a scary "unresolvable function reference" error.
-        return (RValue){ .method = GMLMethod_createUnresolved(varDef->name, -1), .type = RVALUE_METHOD, .ownsString = true, .gmlStackType = GML_TYPE_VARIABLE };
+        return (RValue){ .method = GMLMethod_createUnresolved(varDef->name, -1), .type = RVALUE_METHOD, .ownsReference = true, .gmlStackType = GML_TYPE_VARIABLE };
     }
 #endif
 
@@ -720,7 +761,7 @@ static RValue resolveVariableRead(VMContext* ctx, int32_t instanceType, uint32_t
 
     // Scalar access: return the slot's current value as a weak view (slot retains ownership).
     RValue result = *slot;
-    result.ownsString = false;
+    result.ownsReference = false;
 
 #ifdef ENABLE_VM_TRACING
     // Read tracing for scalar variables
@@ -765,9 +806,77 @@ static void writeSingleInstanceVariable(VMContext* ctx, Instance* inst, Variable
     Instance_setSelfVar(inst, varDef->varID, val);
 }
 
+// Transfer ownership of "val into "*dest", freeing the old value first.
+// Strings are duplicated only if the source view is non-owning (so we don't double-free).
+// Arrays/methods/structs bump refcount when needed and flip the source's ownsReference flag to take a strong ref.
+static inline void writeIntoSlot(RValue* dest, RValue val) {
+    RValue_free(dest);
+    if (val.type == RVALUE_STRING && !val.ownsReference && val.string != nullptr) {
+        *dest = RValue_makeOwnedString(safeStrdup(val.string));
+    } else if (val.type == RVALUE_ARRAY && val.array != nullptr) {
+        if (!val.ownsReference) GMLArray_incRef(val.array);
+        val.ownsReference = true;
+        *dest = val;
+#if IS_BC17_OR_HIGHER_ENABLED
+    } else if (val.type == RVALUE_METHOD && val.method != nullptr) {
+        if (!val.ownsReference) GMLMethod_incRef(val.method);
+        val.ownsReference = true;
+        *dest = val;
+#endif
+    } else if (val.type == RVALUE_STRUCT && val.structInst != nullptr) {
+        if (!val.ownsReference) Instance_structIncRef(val.structInst);
+        val.ownsReference = true;
+        *dest = val;
+    } else {
+        *dest = val;
+    }
+}
+
+// Force out-of-line so the OP_POP fast path in executeLoop doesn't inline this, because we already have an "optimized" version for common writes
+__attribute__((noinline))
 static void resolveVariableWrite(VMContext* ctx, int32_t instanceType, uint32_t varRef, RValue val) {
     Variable* varDef = resolveVarDef(ctx, varRef);
 
+    // Fast path: When the varType==VARTYPE_NORMAL...
+    // * We can skip the popArrayAccess
+    // * We can skip the BC17 STACKTOP and INSTANCE_ARG branches
+    // * We can skip the array-write block itself
+    // * We can skip BOTH instanceType switches
+    if (varDef->varID >= 0) {
+        switch (instanceType) {
+            case INSTANCE_LOCAL: {
+                uint32_t localSlot = resolveLocalSlot(ctx, varDef->varID);
+                require(ctx->localVarCount > localSlot);
+                writeIntoSlot(&ctx->localVars[localSlot], val);
+                return;
+            }
+            case INSTANCE_GLOBAL: {
+                require(ctx->globalVarCount > (uint32_t) varDef->varID);
+                writeIntoSlot(&ctx->globalVars[varDef->varID], val);
+                return;
+            }
+            case INSTANCE_SELF: {
+                Instance* inst = (Instance*) ctx->currentInstance;
+                if (inst != nullptr) {
+                    Instance_setSelfVar(inst, varDef->varID, val);
+                    RValue_free(&val);
+                    return;
+                }
+                break; // fall through to slow path so the existing nullptr-instance error gets logged
+            }
+            case INSTANCE_OTHER: {
+                Instance* inst = (Instance*) ctx->otherInstance;
+                if (inst != nullptr) {
+                    Instance_setSelfVar(inst, varDef->varID, val);
+                    RValue_free(&val);
+                    return;
+                }
+                break; // fall through (otherInstance was nullptr, slow path will use currentInstance)
+            }
+        }
+    }
+
+    // The slow path is used for builtin vars, object/instance references (instanceType >= 0), INSTANCE_ARG/STACKTOP, and other miscellaneous things like if we get a nullptr above
     ArrayAccess access = popArrayAccess(ctx, varRef);
 
     // Use instance type from stack when available (VARTYPE_ARRAY / VARTYPE_STACKTOP)
@@ -849,7 +958,7 @@ static void resolveVariableWrite(VMContext* ctx, int32_t instanceType, uint32_t 
             } else {
                 // Transfer ownership from val into scriptArgs: copy the tagged union as-is and neutralize val so the RValue_free below is a no-op for arrays/methods.
                 ctx->scriptArgs[writeIndex] = val;
-                val.ownsString = false;
+                val.ownsReference = false;
             }
             if (writeIndex >= ctx->scriptArgCount) {
                 ctx->scriptArgCount = writeIndex + 1;
@@ -956,44 +1065,13 @@ static void resolveVariableWrite(VMContext* ctx, int32_t instanceType, uint32_t 
         case INSTANCE_LOCAL: {
             uint32_t localSlot = resolveLocalSlot(ctx, varDef->varID);
             require(ctx->localVarCount > localSlot);
-            RValue* dest = &ctx->localVars[localSlot];
-            RValue_free(dest);
-            if (val.type == RVALUE_STRING && !val.ownsString && val.string != nullptr) {
-                *dest = RValue_makeOwnedString(safeStrdup(val.string));
-            } else if (val.type == RVALUE_ARRAY && val.array != nullptr) {
-                if (!val.ownsString) GMLArray_incRef(val.array);
-                val.ownsString = true;
-                *dest = val;
-#if IS_BC17_OR_HIGHER_ENABLED
-            } else if (val.type == RVALUE_METHOD && val.method != nullptr) {
-                if (!val.ownsString) GMLMethod_incRef(val.method);
-                val.ownsString = true;
-                *dest = val;
-#endif
-            } else {
-                *dest = val;
-            }
+            writeIntoSlot(&ctx->localVars[localSlot], val);
             return;
         }
         case INSTANCE_GLOBAL: {
             require(ctx->globalVarCount > (uint32_t) varDef->varID);
             RValue* dest = &ctx->globalVars[varDef->varID];
-            RValue_free(dest);
-            if (val.type == RVALUE_STRING && !val.ownsString && val.string != nullptr) {
-                *dest = RValue_makeOwnedString(safeStrdup(val.string));
-            } else if (val.type == RVALUE_ARRAY && val.array != nullptr) {
-                if (!val.ownsString) GMLArray_incRef(val.array);
-                val.ownsString = true;
-                *dest = val;
-#if IS_BC17_OR_HIGHER_ENABLED
-            } else if (val.type == RVALUE_METHOD && val.method != nullptr) {
-                if (!val.ownsString) GMLMethod_incRef(val.method);
-                val.ownsString = true;
-                *dest = val;
-#endif
-            } else {
-                *dest = val;
-            }
+            writeIntoSlot(dest, val);
 #ifdef ENABLE_VM_TRACING
             if (shouldTraceVariable(ctx->varWritesToBeTraced, "global", nullptr, varDef->name)) {
                 char* rvalueAsString = RValue_toStringTyped(*dest);
@@ -1050,16 +1128,9 @@ static RValue convertValue(RValue val, uint8_t targetType) {
     }
 }
 
-// ===[ Forward Declarations ]===
-
-static RValue executeLoop(VMContext* ctx);
-static void handleCall(VMContext* ctx, uint32_t instr, const uint8_t* extraData);
-
 // ===[ Opcode Handlers ]===
 
-static void handlePush(VMContext* ctx, uint32_t instr, const uint8_t* extraData) {
-    uint8_t type1 = instrType1(instr);
-
+static void handlePush(VMContext* ctx, uint32_t instr, const uint8_t* extraData, uint8_t type1) {
     switch (type1) {
         case GML_TYPE_DOUBLE:
             stackPush(ctx, RValue_makeReal(BinaryUtils_readFloat64Aligned(extraData)));
@@ -1080,6 +1151,9 @@ static void handlePush(VMContext* ctx, uint32_t instr, const uint8_t* extraData)
             int32_t instanceType = (int32_t) instrInstanceType(instr);
             uint32_t varRef = resolveVarOperand(extraData);
             uint8_t varType = (varRef >> 24) & 0xF8;
+            // BC17: VARTYPE_INSTANCE encodes (instanceId - 100000) in the instruction's lower 16 bits.
+            // Add 100000 back so findInstanceByTarget sees the real runtime instance ID.
+            if (varType == VARTYPE_INSTANCE) instanceType += 100000;
 #if IS_BC17_OR_HIGHER_ENABLED
             if (varType == VARTYPE_ARRAYPUSHAF || varType == VARTYPE_ARRAYPOPAF) {
                 // V17: multi-dim first-step. Stack has [scope, firstIndex] (with an optional real-instance slot underneath when scope == -9 INSTANCE_STACKTOP).
@@ -1140,7 +1214,7 @@ static void handlePush(VMContext* ctx, uint32_t instr, const uint8_t* extraData)
                     RValue_free(topSlot);
                     GMLArray* sub = GMLArray_create(0);
                     sub->owner = top->owner;
-                    *topSlot = (RValue){ .array = sub, .type = RVALUE_ARRAY, .ownsString = true, RVALUE_INIT_GMLTYPE(GML_TYPE_VARIABLE) };
+                    *topSlot = (RValue){ .array = sub, .type = RVALUE_ARRAY, .ownsReference = true, RVALUE_INIT_GMLTYPE(GML_TYPE_VARIABLE) };
                 }
                 // Push a weak ref to the sub-array — short-lived, consumed by the next BREAK op.
                 stackPush(ctx, RValue_makeArrayWeak(topSlot->array));
@@ -1186,37 +1260,6 @@ static void pushTopLevelArrayRef(VMContext* ctx, RValue* slot) {
 }
 #endif
 
-static void handlePushLoc(VMContext* ctx, const uint8_t* extraData) {
-    uint32_t varRef = resolveVarOperand(extraData);
-#if IS_BC17_OR_HIGHER_ENABLED
-    uint8_t varType = (varRef >> 24) & 0xF8;
-    if (varType == VARTYPE_ARRAYPUSHAF || varType == VARTYPE_ARRAYPOPAF) {
-        Variable* varDef = resolveVarDef(ctx, varRef);
-        uint32_t localSlot = resolveLocalSlot(ctx, varDef->varID);
-        require(ctx->localVarCount > localSlot);
-        pushTopLevelArrayRef(ctx, &ctx->localVars[localSlot]);
-        return;
-    }
-#endif
-    RValue val = resolveVariableRead(ctx, INSTANCE_LOCAL, varRef);
-    stackPushTyped(ctx, val, GML_TYPE_VARIABLE);
-}
-
-static void handlePushGlb(VMContext* ctx, const uint8_t* extraData) {
-    uint32_t varRef = resolveVarOperand(extraData);
-#if IS_BC17_OR_HIGHER_ENABLED
-    uint8_t varType = (varRef >> 24) & 0xF8;
-    if (varType == VARTYPE_ARRAYPUSHAF || varType == VARTYPE_ARRAYPOPAF) {
-        Variable* varDef = resolveVarDef(ctx, varRef);
-        require(ctx->globalVarCount > (uint32_t) varDef->varID);
-        pushTopLevelArrayRef(ctx, &ctx->globalVars[varDef->varID]);
-        return;
-    }
-#endif
-    RValue val = resolveVariableRead(ctx, INSTANCE_GLOBAL, varRef);
-    stackPushTyped(ctx, val, GML_TYPE_VARIABLE);
-}
-
 static void handlePushBltn(VMContext* ctx, uint32_t instr, const uint8_t* extraData) {
     uint32_t varRef = resolveVarOperand(extraData);
 #if IS_BC17_OR_HIGHER_ENABLED
@@ -1253,13 +1296,23 @@ static void handlePushI(VMContext* ctx, uint32_t instr) {
     stackPushTyped(ctx, val, GML_TYPE_INT16);
 }
 
-static void handlePop(VMContext* ctx, uint32_t instr, const uint8_t* extraData) {
-    int32_t instanceType = (int32_t) instrInstanceType(instr);
-    uint8_t type1 = instrType1(instr);   // destination type
-    uint8_t type2 = instrType2(instr);   // source type (what's on stack)
-    uint32_t varRef = resolveVarOperand(extraData);
-    uint8_t varType = (varRef >> 24) & 0xF8;
+// When storing into a variant variable from an int32/int64 stack source, coerce to real.
+// GMS variables normalize integer literals to doubles so subsequent arithmetic routes through the real fast path instead of int32 x int32 wrapping.
+static inline RValue coerceIntStoreToReal(RValue val, uint8_t type2) {
+    if (type2 == GML_TYPE_INT32 || type2 == GML_TYPE_INT64 || type2 == GML_TYPE_INT16) {
+        if (val.type == RVALUE_INT32) {
+            return RValue_makeReal((GMLReal) val.int32);
+        }
+#ifndef NO_RVALUE_INT64
+        if (val.type == RVALUE_INT64) {
+            return RValue_makeReal((GMLReal) val.int64);
+        }
+#endif
+    }
+    return val;
+}
 
+static void handlePop(VMContext* ctx, uint32_t instr, uint8_t type1, uint8_t type2, uint32_t varRef, uint8_t varType, int32_t instanceType) {
     RValue val;
     int32_t arrayIndex = -1;
 
@@ -1318,6 +1371,10 @@ static void handlePop(VMContext* ctx, uint32_t instr, const uint8_t* extraData) 
         RValue converted = convertValue(val, type1);
         RValue_free(&val);
         val = converted;
+    }
+
+    if (type1 == GML_TYPE_VARIABLE && !isCompoundAssignment) {
+        val = coerceIntStoreToReal(val, type2);
     }
 
     if (varType == VARTYPE_ARRAY) {
@@ -1422,11 +1479,8 @@ static void handlePopz(VMContext* ctx) {
     RValue_free(&val);
 }
 
-static void handleAdd(VMContext* ctx, uint32_t instr) {
-    uint8_t resultType = instrType2(instr);
-    RValue b = stackPop(ctx);
-    RValue a = stackPop(ctx);
-
+__attribute__((noinline))
+static void handleAddString(VMContext* ctx, RValue a, RValue b, uint8_t resultType) {
     if (a.type == RVALUE_STRING && b.type == RVALUE_STRING) {
         // String concatenation
         const char* sa = a.string != nullptr ? a.string : "";
@@ -1439,7 +1493,7 @@ static void handleAdd(VMContext* ctx, uint32_t instr) {
         RValue_free(&a);
         RValue_free(&b);
         stackPushTyped(ctx, RValue_makeOwnedString(result), resultType);
-    } else if (a.type == RVALUE_STRING || b.type == RVALUE_STRING) {
+    } else {
         // String + Number: convert both to strings and concatenate (GMS behavior)
         char* sa = RValue_toString(a);
         char* sb = RValue_toString(b);
@@ -1453,83 +1507,40 @@ static void handleAdd(VMContext* ctx, uint32_t instr) {
         RValue_free(&a);
         RValue_free(&b);
         stackPushTyped(ctx, RValue_makeOwnedString(result), resultType);
-    } else if (a.type == RVALUE_INT32 && b.type == RVALUE_INT32) {
-        stackPushTyped(ctx, RValue_makeInt32(a.int32 + b.int32), resultType);
-#ifndef NO_RVALUE_INT64
-    } else if (a.type == RVALUE_INT64 && b.type == RVALUE_INT64) {
-        stackPushTyped(ctx, RValue_makeInt64(a.int64 + b.int64), resultType);
-#endif
-    } else {
-        GMLReal result = RValue_toReal(a) + RValue_toReal(b);
-        RValue_free(&a);
-        RValue_free(&b);
-        stackPushTyped(ctx, RValue_makeReal(result), resultType);
     }
 }
 
-static void handleSub(VMContext* ctx, uint32_t instr) {
-    uint8_t resultType = instrType2(instr);
-    RValue b = stackPop(ctx);
-    RValue a = stackPop(ctx);
-    if (a.type == RVALUE_INT32 && b.type == RVALUE_INT32) {
-        stackPushTyped(ctx, RValue_makeInt32(a.int32 - b.int32), resultType);
-#ifndef NO_RVALUE_INT64
-    } else if (a.type == RVALUE_INT64 && b.type == RVALUE_INT64) {
-        stackPushTyped(ctx, RValue_makeInt64(a.int64 - b.int64), resultType);
-#endif
-    } else {
-        GMLReal result = RValue_toReal(a) - RValue_toReal(b);
+__attribute__((noinline))
+static void handleMulString(VMContext* ctx, RValue a, RValue b, uint8_t resultType) {
+    // a.type == RVALUE_STRING; b is the repetition count.
+    int count = RValue_toInt32(b);
+    const char* str = a.string != nullptr ? a.string : "";
+    size_t len = strlen(str);
+    if (0 >= count || len == 0) {
         RValue_free(&a);
         RValue_free(&b);
-        stackPushTyped(ctx, RValue_makeReal(result), resultType);
-    }
-}
-
-static void handleMul(VMContext* ctx, uint32_t instr) {
-    uint8_t resultType = instrType2(instr);
-    RValue b = stackPop(ctx);
-    RValue a = stackPop(ctx);
-
-    if (a.type == RVALUE_STRING) {
-        // String * Number = string repetition
-        int count = RValue_toInt32(b);
-        const char* str = a.string != nullptr ? a.string : "";
-        size_t len = strlen(str);
-        if (count <= 0 || len == 0) {
-            RValue_free(&a);
-            RValue_free(&b);
-            stackPushTyped(ctx, RValue_makeOwnedString(safeStrdup("")), resultType);
-        } else {
-            char* result = safeMalloc(len * count + 1);
-            repeat(count, i) {
-                memcpy(result + i * len, str, len);
-            }
-            result[len * count] = '\0';
-            RValue_free(&a);
-            RValue_free(&b);
-            stackPushTyped(ctx, RValue_makeOwnedString(result), resultType);
+        stackPushTyped(ctx, RValue_makeOwnedString(safeStrdup("")), resultType);
+    } else {
+        char* result = safeMalloc(len * count + 1);
+        repeat(count, i) {
+            memcpy(result + i * len, str, len);
         }
-    } else if (a.type == RVALUE_INT32 && b.type == RVALUE_INT32) {
-        stackPushTyped(ctx, RValue_makeInt32(a.int32 * b.int32), resultType);
-#ifndef NO_RVALUE_INT64
-    } else if (a.type == RVALUE_INT64 && b.type == RVALUE_INT64) {
-        stackPushTyped(ctx, RValue_makeInt64(a.int64 * b.int64), resultType);
-#endif
-    } else {
-        GMLReal result = RValue_toReal(a) * RValue_toReal(b);
+        result[len * count] = '\0';
         RValue_free(&a);
         RValue_free(&b);
-        stackPushTyped(ctx, RValue_makeReal(result), resultType);
+        stackPushTyped(ctx, RValue_makeOwnedString(result), resultType);
     }
 }
 
 static void handleDiv(VMContext* ctx, uint32_t instr) {
     RValue b = stackPop(ctx);
     RValue a = stackPop(ctx);
-    GMLReal divisor = RValue_toReal(b);   
-    if (divisor == 0.0) {
-        fprintf(stderr, "VM: DoDiv :: Divide by zero\n");
-        abort();
+    uint8_t type1 = instrType1(instr);
+    uint8_t type2 = instrType2(instr);
+    GMLReal divisor = RValue_toReal(b);
+    // In GameMaker's native runner, ONLY integer/integer division throws a hard error on zero, float/variable types rely on IEEE 754 (produces NaN)
+    if ((type1 == GML_TYPE_INT32 || type1 == GML_TYPE_INT64) && (type2 == GML_TYPE_INT32 || type2 == GML_TYPE_INT64)) {
+        requireMessageFormatted(divisor != 0.0, "VM: [%s] DoDiv :: Divide by zero", ctx->currentCodeName);
     }
     GMLReal result = RValue_toReal(a) / divisor;
     RValue_free(&a);
@@ -1541,10 +1552,7 @@ static void handleRem(VMContext* ctx, uint32_t instr) {
     RValue b = stackPop(ctx);
     RValue a = stackPop(ctx);
     int32_t ib = RValue_toInt32(b);
-    if (ib == 0) {
-        fprintf(stderr, "VM: DoRem :: Divide by zero\n");
-        abort();
-    }
+    requireMessageFormatted(ib != 0, "VM: [%s] DoRem :: Divide by zero", ctx->currentCodeName);
     int32_t result = RValue_toInt32(a) % ib;
     RValue_free(&a);
     RValue_free(&b);
@@ -1555,10 +1563,7 @@ static void handleMod(VMContext* ctx, uint32_t instr) {
     RValue b = stackPop(ctx);
     RValue a = stackPop(ctx);
     GMLReal divisor = RValue_toReal(b);
-    if (divisor == 0.0) {
-        fprintf(stderr, "VM: DoMod :: Divide by zero\n");
-        abort();
-    }
+    requireMessageFormatted(divisor != 0.0, "VM: [%s] DoMod :: Divide by zero", ctx->currentCodeName);
     GMLReal result = GMLReal_fmod(RValue_toReal(a), divisor);
     RValue_free(&a);
     RValue_free(&b);
@@ -1612,13 +1617,9 @@ static void handleShr(VMContext* ctx, uint32_t instr) {
     SIMPLE_BYTECODE_BITWISE_OPERATION(>>);
 }
 
-static void handleConv(VMContext* ctx, uint32_t instr) {
-    uint8_t srcType = instrType1(instr);
-    uint8_t dstType = instrType2(instr);
-
+static void handleConv(VMContext* ctx, uint8_t srcType, uint8_t dstType, uint8_t convKey) {
     RValue val = stackPop(ctx);
 
-    uint8_t convKey = (dstType << 4) | srcType;
     RValue result;
 
     switch (convKey) {
@@ -1700,7 +1701,7 @@ static void handleConv(VMContext* ctx, uint32_t instr) {
         case 0x5F: result = val; break;
 
         default:
-            fprintf(stderr, "VM: Conv unhandled conversion 0x%02X (src=0x%X dst=0x%X)\n", convKey, srcType, dstType);
+            fprintf(stderr, "VM: [%s] Conv unhandled conversion 0x%02X (src=0x%X dst=0x%X)\n", ctx->currentCodeName, convKey, srcType, dstType);
             result = val;
             break;
     }
@@ -1765,6 +1766,14 @@ static void handleCmp(VMContext* ctx, uint32_t instr) {
             default:      result = false; break;
         }
 #endif
+    } else if (a.type == RVALUE_STRUCT || b.type == RVALUE_STRUCT) {
+        // Struct is only == to the same struct (identity comparison)
+        bool eq = (a.type == RVALUE_STRUCT && b.type == RVALUE_STRUCT) && (a.structInst == b.structInst);
+        switch (cmpKind) {
+            case CMP_EQ:  result = eq;  break;
+            case CMP_NEQ: result = !eq; break;
+            default:      result = false; break;
+        }
     } else if (a.type == RVALUE_STRING && b.type == RVALUE_STRING) {
         int cmp = strcmp(a.string != nullptr ? a.string : "", b.string != nullptr ? b.string : "");
         switch (cmpKind) {
@@ -1914,30 +1923,19 @@ static void handleDup(VMContext* ctx, uint32_t instr) {
 
         // If the value owns a string, duplicate it to avoid double-free.
         // For arrays and methods, bump the refcount so each duplicate independently owns a reference.
-        if (copy.type == RVALUE_STRING && copy.ownsString && copy.string != nullptr) {
+        if (copy.type == RVALUE_STRING && copy.ownsReference && copy.string != nullptr) {
             copy.string = safeStrdup(copy.string);
-        } else if (copy.type == RVALUE_ARRAY && copy.ownsString && copy.array != nullptr) {
+        } else if (copy.type == RVALUE_ARRAY && copy.ownsReference && copy.array != nullptr) {
             GMLArray_incRef(copy.array);
 #if IS_BC17_OR_HIGHER_ENABLED
-        } else if (copy.type == RVALUE_METHOD && copy.ownsString && copy.method != nullptr) {
+        } else if (copy.type == RVALUE_METHOD && copy.ownsReference && copy.method != nullptr) {
             GMLMethod_incRef(copy.method);
 #endif
+        } else if (copy.type == RVALUE_STRUCT && copy.ownsReference && copy.structInst != nullptr) {
+            Instance_structIncRef(copy.structInst);
         }
 
         stackPush(ctx, copy);
-    }
-}
-
-static void handleBranch(VMContext* ctx, uint32_t instr, uint32_t instrAddr) {
-    int32_t offset = instrJumpOffset(instr);
-    ctx->ip = instrAddr + offset;
-}
-
-static void handleConditionalBranch(VMContext* ctx, uint32_t instr, uint32_t instrAddr, bool expected) {
-    bool condition = stackPopInt32(ctx) != 0;
-    if (condition == expected) {
-        int32_t offset = instrJumpOffset(instr);
-        ctx->ip = instrAddr + offset;
     }
 }
 
@@ -2264,7 +2262,7 @@ static void handlePushEnv(VMContext* ctx, uint32_t instr, uint32_t instrAddr) {
 
     if (target >= 100000) {
         // Instance ID - find specific instance
-        Instance* inst = hmget(runner->instancesToId, target);
+        Instance* inst = hmget(runner->instancesById, target);
         if (inst != nullptr && inst->active) {
             switchToInstance(ctx, inst);
             return;
@@ -2275,7 +2273,7 @@ static void handlePushEnv(VMContext* ctx, uint32_t instr, uint32_t instrAddr) {
         return;
     }
 
-    fprintf(stderr, "VM: PushEnv with unhandled target %d\n", target);
+    fprintf(stderr, "VM: [%s] PushEnv with unhandled target %d\n", ctx->currentCodeName, target);
     ctx->ip = instrAddr + jumpOffset;
 }
 
@@ -2359,6 +2357,179 @@ static const char* opcodeName(uint8_t opcode) {
     }
 }
 
+#ifdef ENABLE_VM_OPCODE_PROFILER
+static char gmlTypeChar(uint8_t type);
+
+static const char* rvalueTypeName(uint8_t type) {
+    switch (type) {
+        case RVALUE_REAL:      return "REAL";
+        case RVALUE_STRING:    return "STRING";
+        case RVALUE_INT32:     return "INT32";
+        case RVALUE_INT64:     return "INT64";
+        case RVALUE_BOOL:      return "BOOL";
+        case RVALUE_UNDEFINED: return "UNDEF";
+        case RVALUE_ARRAY:     return "ARRAY";
+        case RVALUE_METHOD:    return "METHOD";
+        case RVALUE_STRUCT:    return "STRUCT";
+        case 0xF:              return "-";
+        default:               return "???";
+    }
+}
+
+static const char* breakSubOpName(int16_t breakType) {
+    switch (breakType) {
+        case BREAK_CHKINDEX:    return "chkindex";
+        case BREAK_PUSHAF:      return "pushaf";
+        case BREAK_POPAF:       return "popaf";
+        case BREAK_PUSHAC:      return "pushac";
+        case BREAK_SETOWNER:    return "setowner";
+        case BREAK_ISSTATICOK:  return "isstaticok";
+        case BREAK_SETSTATIC:   return "setstatic";
+        case BREAK_SAVEAREF:    return "savearef";
+        case BREAK_RESTOREAREF: return "restorearef";
+        default:                return "???";
+    }
+}
+
+void VM_printOpcodeProfilerReport(const VMContext* ctx) {
+    if (!ctx->opcodeProfilerEnabled) return;
+
+    typedef struct { uint16_t key; uint64_t count; } CountEntry;
+    CountEntry entries[256];
+    int entryCount = 0;
+    uint64_t total = 0;
+    for (int i = 0; 256 > i; i++) {
+        if (ctx->opcodeCounts[i] > 0) {
+            entries[entryCount].key = (uint16_t) i;
+            entries[entryCount].count = ctx->opcodeCounts[i];
+            entryCount++;
+            total += ctx->opcodeCounts[i];
+        }
+    }
+
+    // Simple insertion sort (max 256 entries, runs once at shutdown)
+    for (int i = 1; entryCount > i; i++) {
+        CountEntry tmp = entries[i];
+        int j = i;
+        while (j > 0 && entries[j - 1].count < tmp.count) {
+            entries[j] = entries[j - 1];
+            j--;
+        }
+        entries[j] = tmp;
+    }
+
+    fprintf(stderr, "=== Opcode Profiler Report ===\n");
+    fprintf(stderr, "Total instructions executed: %llu\n", (unsigned long long) total);
+    fprintf(stderr, "%-12s %-6s %16s %8s\n", "Opcode", "Hex", "Count", "Pct");
+    forEachIndexed(CountEntry, entry, i, entries, entryCount) {
+        (void) i;
+        double pct = total > 0 ? (100.0 * (double) entry->count / (double) total) : 0.0;
+        fprintf(stderr, "%-12s 0x%02X   %16llu %7.2f%%\n", opcodeName((uint8_t) entry->key), (uint8_t) entry->key, (unsigned long long) entry->count, pct);
+    }
+
+    // Per-opcode breakdown by type variant. Sorted within each opcode by count desc.
+    fprintf(stderr, "\n--- Type variant breakdown (per opcode) ---\n");
+    forEachIndexed(CountEntry, entry, idx, entries, entryCount) {
+        (void) idx;
+        uint8_t opcode = (uint8_t) entry->key;
+        const uint64_t* variants = &ctx->opcodeVariantCounts[opcode * 256];
+
+        CountEntry variantEntries[256];
+        int variantCount = 0;
+        for (int t = 0; 256 > t; t++) {
+            if (variants[t] > 0) {
+                variantEntries[variantCount].key = (uint16_t) t;
+                variantEntries[variantCount].count = variants[t];
+                variantCount++;
+            }
+        }
+        for (int i = 1; variantCount > i; i++) {
+            CountEntry tmp = variantEntries[i];
+            int j = i;
+            while (j > 0 && variantEntries[j - 1].count < tmp.count) {
+                variantEntries[j] = variantEntries[j - 1];
+                j--;
+            }
+            variantEntries[j] = tmp;
+        }
+
+        fprintf(stderr, "%s (0x%02X): %llu total\n", opcodeName(opcode), opcode, (unsigned long long) entry->count);
+        forEachIndexed(CountEntry, ve, vi, variantEntries, variantCount) {
+            (void) vi;
+            uint8_t type1 = (uint8_t) ((ve->key >> 4) & 0xF);
+            uint8_t type2 = (uint8_t) (ve->key & 0xF);
+            double vpct = entry->count > 0 ? (100.0 * (double) ve->count / (double) entry->count) : 0.0;
+            fprintf(stderr, "    .%c.%c  %16llu %7.2f%%\n", gmlTypeChar(type1), gmlTypeChar(type2), (unsigned long long) ve->count, vpct);
+        }
+
+        // Runtime RValue type breakdown (a, b types observed at execution time)
+        {
+            const uint64_t* rvCounts = &ctx->opcodeRValueTypeCounts[opcode * 256];
+            CountEntry rvEntries[256];
+            int rvCount = 0;
+            uint64_t rvTotal = 0;
+            for (int t = 0; 256 > t; t++) {
+                if (rvCounts[t] > 0) {
+                    rvEntries[rvCount].key = (uint16_t) t;
+                    rvEntries[rvCount].count = rvCounts[t];
+                    rvCount++;
+                    rvTotal += rvCounts[t];
+                }
+            }
+            if (rvCount > 0) {
+                for (int i = 1; rvCount > i; i++) {
+                    CountEntry tmp = rvEntries[i];
+                    int j = i;
+                    while (j > 0 && rvEntries[j - 1].count < tmp.count) {
+                        rvEntries[j] = rvEntries[j - 1];
+                        j--;
+                    }
+                    rvEntries[j] = tmp;
+                }
+                fprintf(stderr, "    -- runtime types (a, b):\n");
+                forEachIndexed(CountEntry, re, ri, rvEntries, rvCount) {
+                    (void) ri;
+                    uint8_t typeA = (uint8_t) ((re->key >> 4) & 0xF);
+                    uint8_t typeB = (uint8_t) (re->key & 0xF);
+                    double rpct = rvTotal > 0 ? (100.0 * (double) re->count / (double) rvTotal) : 0.0;
+                    fprintf(stderr, "    (%-6s, %-6s) %16llu %7.2f%%\n", rvalueTypeName(typeA), rvalueTypeName(typeB), (unsigned long long) re->count, rpct);
+                }
+            }
+        }
+
+        // Extended BREAK (0xFF) sub-opcode breakdown
+        if (opcode == OP_BREAK) {
+            CountEntry breakEntries[64];
+            int breakCount = 0;
+            for (int i = 0; 64 > i; i++) {
+                if (ctx->breakSubOpCounts[i] > 0) {
+                    breakEntries[breakCount].key = (uint16_t) i;
+                    breakEntries[breakCount].count = ctx->breakSubOpCounts[i];
+                    breakCount++;
+                }
+            }
+            for (int i = 1; breakCount > i; i++) {
+                CountEntry tmp = breakEntries[i];
+                int j = i;
+                while (j > 0 && breakEntries[j - 1].count < tmp.count) {
+                    breakEntries[j] = breakEntries[j - 1];
+                    j--;
+                }
+                breakEntries[j] = tmp;
+            }
+            fprintf(stderr, "    -- sub-opcodes:\n");
+            forEachIndexed(CountEntry, be, bi, breakEntries, breakCount) {
+                (void) bi;
+                int16_t breakType = (int16_t) -((int) be->key);
+                double bpct = entry->count > 0 ? (100.0 * (double) be->count / (double) entry->count) : 0.0;
+                fprintf(stderr, "    %-12s (%4d) %16llu %7.2f%%\n", breakSubOpName(breakType), (int) breakType, (unsigned long long) be->count, bpct);
+            }
+        }
+    }
+    fprintf(stderr, "==============================\n");
+}
+#endif // ENABLE_VM_OPCODE_PROFILER
+
 // Forward declaration for formatInstruction (defined in disassembler section, used by trace-opcodes)
 static void formatInstruction(VMContext* ctx, const uint8_t* bytecodeBase, uint32_t instrAddr, uint32_t instr, const uint8_t* extraData, char* opcodeStr, size_t opcodeSize, char* operandStr, size_t operandSize, char* commentStr, size_t commentSize);
 
@@ -2383,7 +2554,7 @@ static void handleBreakPushAF(VMContext* ctx) {
     RValue* cell = arrayRef.type == RVALUE_ARRAY ? GMLArray_slot(arrayRef.array, idx) : nullptr;
     if (cell != nullptr) {
         result = *cell;
-        result.ownsString = false; // weak view
+        result.ownsReference = false; // weak view
     } else {
         result = (RValue){ .type = RVALUE_UNDEFINED };
     }
@@ -2424,7 +2595,7 @@ static void handleBreakPushAC(VMContext* ctx, uint32_t instrAddr) {
         RValue_free(parentSlot);
         GMLArray* sub = GMLArray_create(0);
         sub->owner = parent->owner;
-        *parentSlot = (RValue){ .array = sub, .type = RVALUE_ARRAY, .ownsString = true, RVALUE_INIT_GMLTYPE(GML_TYPE_VARIABLE) };
+        *parentSlot = (RValue){ .array = sub, .type = RVALUE_ARRAY, .ownsReference = true, RVALUE_INIT_GMLTYPE(GML_TYPE_VARIABLE) };
     }
     stackPush(ctx, RValue_makeArrayWeak(parentSlot->array));
     RValue_free(&arrayRef);
@@ -2487,30 +2658,73 @@ static void handleBreak(VMContext* ctx, uint32_t instr, uint32_t instrAddr) {
 }
 #endif
 
+#define VM_SYNC_IP()    do { ctx->ip = ip; } while (0)
+#define VM_RELOAD_IP()  do { ip = ctx->ip; } while (0)
+
 static RValue executeLoop(VMContext* ctx) {
     // codeEnd and bytecodeBase are invariant for the lifetime of this executeLoop call, so let's hoist them to avoid the compiler emitting code to
     // reload the values at the end of every iteration.
     const uint32_t codeEnd = ctx->codeEnd;
     const uint8_t* const bytecodeBase = ctx->bytecodeBase;
+    // If you just joined the stream: ip is short for instruction pointer chat
+    // The ip is mutable, so we need to use VM_SYNC_IP and VM_RELOAD_IP every time an opcode handler may access it or write to it
+    uint32_t ip = ctx->ip;
 
-    while (codeEnd > ctx->ip) {
-#ifdef ENABLE_VM_PROFILER
+    // Some opcodes have their handler or parts of their handler inlined
+    // Those are opcodes that during real gameplay (using "--profile-opcodes") shown that, with inlining and keeping only the frequently called handle parts, we could squeeze MORE performance from the interpreter!
+    while (codeEnd > ip) {
+#ifdef ENABLE_VM_GML_PROFILER
         if (ctx->profiler != nullptr)
             Profiler_tickInstruction(ctx->profiler);
 #endif
-        uint32_t instrAddr = ctx->ip;
-        uint32_t instr = BinaryUtils_readUint32Aligned(bytecodeBase + ctx->ip);
-        ctx->ip += 4;
+        uint32_t instrAddr = ip;
+        uint32_t instr = BinaryUtils_readUint32Aligned(bytecodeBase + ip);
+        ip += 4;
 
         // extraData pointer (may not be used depending on opcode)
-        const uint8_t* extraData = bytecodeBase + ctx->ip;
+        const uint8_t* extraData = bytecodeBase + ip;
 
         // If instruction has extra data (bit 30 set), advance IP past it
         if (instrHasExtraData(instr)) {
-            ctx->ip += extraDataSize(instrType1(instr));
+            ip += extraDataSize(instrType1(instr));
         }
 
         uint8_t opcode = instrOpcode(instr);
+
+#ifdef ENABLE_VM_OPCODE_PROFILER
+        if (ctx->opcodeProfilerEnabled) {
+            ctx->opcodeCounts[opcode]++;
+            ctx->opcodeVariantCounts[opcode * 256 + instrType1(instr) * 16 + instrType2(instr)]++;
+            if (opcode == OP_BREAK) {
+                int16_t breakType = instrInstanceType(instr);
+                int idx = -breakType;
+                if (idx >= 0 && 64 > idx) {
+                    ctx->breakSubOpCounts[idx]++;
+                }
+            }
+            // Capture actual runtime RValue types for arithmetic/comparison/conversion ops.
+            // typeB = 0xF sentinel for unary ops (no second operand).
+            uint8_t rvTypeA = 0xFF, rvTypeB = 0xF;
+            switch (opcode) {
+                case OP_MUL: case OP_DIV: case OP_REM: case OP_MOD:
+                case OP_ADD: case OP_SUB: case OP_AND: case OP_OR:
+                case OP_XOR: case OP_SHL: case OP_SHR: case OP_CMP:
+                    if (ctx->stack.top >= 2) {
+                        rvTypeA = ctx->stack.slots[ctx->stack.top - 2].type;
+                        rvTypeB = ctx->stack.slots[ctx->stack.top - 1].type;
+                    }
+                    break;
+                case OP_NEG: case OP_NOT: case OP_CONV:
+                    if (ctx->stack.top >= 1) {
+                        rvTypeA = ctx->stack.slots[ctx->stack.top - 1].type;
+                    }
+                    break;
+            }
+            if (rvTypeA != 0xFF) {
+                ctx->opcodeRValueTypeCounts[opcode * 256 + (rvTypeA & 0xF) * 16 + (rvTypeB & 0xF)]++;
+            }
+        }
+#endif
 
 #ifdef ENABLE_VM_TRACING
         if (shlen(ctx->opcodesToBeTraced) > 0 && ctx->runner->frameCount >= ctx->traceBytecodeAfterFrame) {
@@ -2532,15 +2746,66 @@ static RValue executeLoop(VMContext* ctx) {
 
         switch (opcode) {
             // Push instructions
-            case OP_PUSH:
-                handlePush(ctx, instr, extraData);
+            case OP_PUSH: {
+                uint8_t type1 = instrType1(instr);
+                // Inline fast paths for variable reads (not ints, doubles, etc, only VARIABLES) that are "normal" type (not arrays, not stacktop, and not the new fangled BC17 array reads)
+                if (type1 == GML_TYPE_VARIABLE) {
+                    uint32_t varRef = resolveVarOperand(extraData);
+                    uint8_t varType = (uint8_t) ((varRef >> 24) & 0xF8);
+                    if (varType == VARTYPE_NORMAL) {
+                        Variable* varDef = resolveVarDef(ctx, varRef);
+                        if (varDef->varID >= 0) {
+                            int32_t instanceType = (int32_t) instrInstanceType(instr);
+                            RValue val;
+                            if (tryFastVarRead(ctx, instanceType, varDef, &val)) {
+                                stackPushTyped(ctx, val, GML_TYPE_VARIABLE);
+                                break;
+                            }
+                        }
+                    }
+                }
+                handlePush(ctx, instr, extraData, type1);
                 break;
-            case OP_PUSHLOC:
-                handlePushLoc(ctx, extraData);
+            }
+            case OP_PUSHLOC: {
+                uint32_t varRef = resolveVarOperand(extraData);
+#if IS_BC17_OR_HIGHER_ENABLED
+                uint8_t varType = (uint8_t) ((varRef >> 24) & 0xF8);
+                if (varType == VARTYPE_ARRAYPUSHAF || varType == VARTYPE_ARRAYPOPAF) {
+                    Variable* varDef = resolveVarDef(ctx, varRef);
+                    uint32_t localSlot = resolveLocalSlot(ctx, varDef->varID);
+                    require(ctx->localVarCount > localSlot);
+                    pushTopLevelArrayRef(ctx, &ctx->localVars[localSlot]);
+                    break;
+                }
+#endif
+                // Locals are always non-builtin (varID >= 0); inline the read straight from localVars[].
+                Variable* varDef = resolveVarDef(ctx, varRef);
+                uint32_t localSlot = resolveLocalSlot(ctx, varDef->varID);
+                require(ctx->localVarCount > localSlot);
+                RValue val = ctx->localVars[localSlot];
+                val.ownsReference = false;
+                stackPushTyped(ctx, val, GML_TYPE_VARIABLE);
                 break;
-            case OP_PUSHGLB:
-                handlePushGlb(ctx, extraData);
+            }
+            case OP_PUSHGLB: {
+                uint32_t varRef = resolveVarOperand(extraData);
+                // Globals are not ALWAYS non-builtin (varID >= 0), some games may use the deprecated global builtins (like "score") with PUSHGLB.
+                // So due to that, we'll take the slow path if it is a builtin variable.
+                // The native runner does NOT handle global arrays from this path, so we don't need to care about them.
+                Variable* varDef = resolveVarDef(ctx, varRef);
+                if (varDef->varID == -6) {
+                    RValue val = resolveVariableRead(ctx, INSTANCE_GLOBAL, varRef);
+                    stackPushTyped(ctx, val, GML_TYPE_VARIABLE);
+                    break;
+                }
+                // Inline the read straight from globalVars[].
+                require(ctx->globalVarCount > (uint32_t) varDef->varID);
+                RValue val = ctx->globalVars[varDef->varID];
+                val.ownsReference = false;
+                stackPushTyped(ctx, val, GML_TYPE_VARIABLE);
                 break;
+            }
             case OP_PUSHBLTN:
                 handlePushBltn(ctx, instr, extraData);
                 break;
@@ -2549,17 +2814,145 @@ static RValue executeLoop(VMContext* ctx) {
                 break;
 
             // Pop instructions
-            case OP_POP:
-                handlePop(ctx, instr, extraData);
+            case OP_POP: {
+                uint8_t type1 = instrType1(instr);
+                uint32_t varRef = resolveVarOperand(extraData);
+                uint8_t varType = (uint8_t) ((varRef >> 24) & 0xF8);
+                int32_t instanceType = instrInstanceType(instr);
+                // BC17: VARTYPE_INSTANCE encodes (instanceId - 100000) in the instruction's lower 16 bits.
+                if (varType == VARTYPE_INSTANCE) instanceType += 100000;
+                int32_t type2 = instrType2(instr); // source type (what's on stack)
+                if (type1 == GML_TYPE_VARIABLE && varType == VARTYPE_NORMAL) {
+                    // Inline fast path for the simple variable-assignment case: type1==VARIABLE, which is ~99.998% of all Pops in real workloads
+                    RValue val = stackPop(ctx);
+                    val = coerceIntStoreToReal(val, type2);
+                    resolveVariableWrite(ctx, instanceType, varRef, val);
+                } else {
+                    handlePop(ctx, instr, type1, type2, varRef, varType, instanceType);
+                }
                 break;
+            }
             case OP_POPZ:
                 handlePopz(ctx);
                 break;
 
             // Arithmetic
-            case OP_ADD: handleAdd(ctx, instr); break;
-            case OP_SUB: handleSub(ctx, instr); break;
-            case OP_MUL: handleMul(ctx, instr); break;
+            // We keep the number + number operations inlined in executeLoop, keeping only the slow path for string concat/repetition
+            case OP_ADD: {
+                RValue* slotA = &ctx->stack.slots[ctx->stack.top - 2];
+                RValue* slotB = &ctx->stack.slots[ctx->stack.top - 1];
+                uint8_t aType = slotA->type;
+                uint8_t bType = slotB->type;
+                if ((aType == RVALUE_INT32 || aType == RVALUE_REAL) && (bType == RVALUE_INT32 || bType == RVALUE_REAL)) {
+                    if (aType == RVALUE_INT32 && bType == RVALUE_INT32) {
+                        slotA->int32 = slotA->int32 + slotB->int32;
+                    } else {
+                        // Read both operands as locals before writing back, since the union means
+                        // slotA->real and slotA->int32 share storage.
+                        GMLReal aVal = (aType == RVALUE_INT32) ? (GMLReal) slotA->int32 : slotA->real;
+                        GMLReal bVal = (bType == RVALUE_INT32) ? (GMLReal) slotB->int32 : slotB->real;
+                        slotA->real = aVal + bVal;
+                        slotA->type = RVALUE_REAL;
+                    }
+#if IS_BC17_OR_HIGHER_ENABLED
+                    if (IS_BC17_OR_HIGHER(ctx)) slotA->gmlStackType = instrType2(instr);
+#endif
+                    ctx->stack.top--;
+                } else {
+                    uint8_t resultType = instrType2(instr);
+                    RValue b = stackPop(ctx);
+                    RValue a = stackPop(ctx);
+                    if (a.type == RVALUE_STRING || b.type == RVALUE_STRING) {
+                        handleAddString(ctx, a, b, resultType);
+                        break;
+                    }
+#ifndef NO_RVALUE_INT64
+                    if (a.type == RVALUE_INT64 && b.type == RVALUE_INT64) {
+                        stackPushTyped(ctx, RValue_makeInt64(a.int64 + b.int64), resultType);
+                        break;
+                    }
+#endif
+                    GMLReal result = RValue_toReal(a) + RValue_toReal(b);
+                    RValue_free(&a);
+                    RValue_free(&b);
+                    stackPushTyped(ctx, RValue_makeReal(result), resultType);
+                }
+                break;
+            }
+            case OP_SUB: {
+                RValue* slotA = &ctx->stack.slots[ctx->stack.top - 2];
+                RValue* slotB = &ctx->stack.slots[ctx->stack.top - 1];
+                uint8_t aType = slotA->type;
+                uint8_t bType = slotB->type;
+                if ((aType == RVALUE_INT32 || aType == RVALUE_REAL) && (bType == RVALUE_INT32 || bType == RVALUE_REAL)) {
+                    if (aType == RVALUE_INT32 && bType == RVALUE_INT32) {
+                        slotA->int32 = slotA->int32 - slotB->int32;
+                    } else {
+                        GMLReal aVal = (aType == RVALUE_INT32) ? (GMLReal) slotA->int32 : slotA->real;
+                        GMLReal bVal = (bType == RVALUE_INT32) ? (GMLReal) slotB->int32 : slotB->real;
+                        slotA->real = aVal - bVal;
+                        slotA->type = RVALUE_REAL;
+                    }
+#if IS_BC17_OR_HIGHER_ENABLED
+                    if (IS_BC17_OR_HIGHER(ctx)) slotA->gmlStackType = instrType2(instr);
+#endif
+                    ctx->stack.top--;
+                } else {
+                    uint8_t resultType = instrType2(instr);
+                    RValue b = stackPop(ctx);
+                    RValue a = stackPop(ctx);
+#ifndef NO_RVALUE_INT64
+                    if (a.type == RVALUE_INT64 && b.type == RVALUE_INT64) {
+                        stackPushTyped(ctx, RValue_makeInt64(a.int64 - b.int64), resultType);
+                        break;
+                    }
+#endif
+                    GMLReal result = RValue_toReal(a) - RValue_toReal(b);
+                    RValue_free(&a);
+                    RValue_free(&b);
+                    stackPushTyped(ctx, RValue_makeReal(result), resultType);
+                }
+                break;
+            }
+            case OP_MUL: {
+                RValue* slotA = &ctx->stack.slots[ctx->stack.top - 2];
+                RValue* slotB = &ctx->stack.slots[ctx->stack.top - 1];
+                uint8_t aType = slotA->type;
+                uint8_t bType = slotB->type;
+                if ((aType == RVALUE_INT32 || aType == RVALUE_REAL) && (bType == RVALUE_INT32 || bType == RVALUE_REAL)) {
+                    if (aType == RVALUE_INT32 && bType == RVALUE_INT32) {
+                        slotA->int32 = slotA->int32 * slotB->int32;
+                    } else {
+                        GMLReal aVal = (aType == RVALUE_INT32) ? (GMLReal) slotA->int32 : slotA->real;
+                        GMLReal bVal = (bType == RVALUE_INT32) ? (GMLReal) slotB->int32 : slotB->real;
+                        slotA->real = aVal * bVal;
+                        slotA->type = RVALUE_REAL;
+                    }
+#if IS_BC17_OR_HIGHER_ENABLED
+                    if (IS_BC17_OR_HIGHER(ctx)) slotA->gmlStackType = instrType2(instr);
+#endif
+                    ctx->stack.top--;
+                } else {
+                    uint8_t resultType = instrType2(instr);
+                    RValue b = stackPop(ctx);
+                    RValue a = stackPop(ctx);
+                    if (a.type == RVALUE_STRING) {
+                        handleMulString(ctx, a, b, resultType);
+                        break;
+                    }
+#ifndef NO_RVALUE_INT64
+                    if (a.type == RVALUE_INT64 && b.type == RVALUE_INT64) {
+                        stackPushTyped(ctx, RValue_makeInt64(a.int64 * b.int64), resultType);
+                        break;
+                    }
+#endif
+                    GMLReal result = RValue_toReal(a) * RValue_toReal(b);
+                    RValue_free(&a);
+                    RValue_free(&b);
+                    stackPushTyped(ctx, RValue_makeReal(result), resultType);
+                }
+                break;
+            }
             case OP_DIV: handleDiv(ctx, instr); break;
             case OP_REM: handleRem(ctx, instr); break;
             case OP_MOD: handleMod(ctx, instr); break;
@@ -2576,14 +2969,109 @@ static RValue executeLoop(VMContext* ctx) {
             case OP_NOT: handleNot(ctx, instr); break;
 
             // Type conversion
-            case OP_CONV:
-                handleConv(ctx, instr);
+            case OP_CONV: {
+                uint8_t srcType = instrType1(instr);
+                uint8_t dstType = instrType2(instr);
+                uint8_t convKey = (uint8_t) ((dstType << 4) | srcType);
+                RValue* top = &ctx->stack.slots[ctx->stack.top - 1];
+                bool fastHit = false;
+
+                // Inline fast paths for the four conversions that account for ~93% of all Conv opcodes in real workloads
+                switch (convKey) {
+                    case 0x52: // Int32 -> Variable (pure passthrough; just retag stack slot)
+                        fastHit = true;
+                        break;
+                    case 0x45: // Variable -> Bool
+                        if (top->type == RVALUE_INT32) {
+                            top->int32 = top->int32 > 0 ? 1 : 0;
+                            top->type = RVALUE_BOOL;
+                            fastHit = true;
+                        } else if (top->type == RVALUE_BOOL) {
+                            // Already 0/1; nothing to do
+                            fastHit = true;
+                        } else if (top->type == RVALUE_REAL) {
+                            top->int32 = top->real > (GMLReal) 0.5 ? 1 : 0;
+                            top->type = RVALUE_BOOL;
+                            fastHit = true;
+                        }
+                        break;
+                    case 0x25: // Variable -> Int32
+                        if (top->type == RVALUE_INT32) {
+                            fastHit = true;
+                        } else if (top->type == RVALUE_BOOL) {
+                            top->type = RVALUE_INT32;
+                            fastHit = true;
+                        } else if (top->type == RVALUE_REAL) {
+                            top->int32 = (int32_t) top->real;
+                            top->type = RVALUE_INT32;
+                            fastHit = true;
+                        }
+                        break;
+                    case 0x02: // Int32 -> Double (Real)
+                        top->real = (GMLReal) top->int32;
+                        top->type = RVALUE_REAL;
+                        fastHit = true;
+                        break;
+                }
+
+                if (fastHit) {
+#if IS_BC17_OR_HIGHER_ENABLED
+                    if (IS_BC17_OR_HIGHER(ctx)) top->gmlStackType = dstType;
+#endif
+                } else {
+                    handleConv(ctx, srcType, dstType, convKey);
+                }
                 break;
+            }
 
             // Comparison
-            case OP_CMP:
-                handleCmp(ctx, instr);
+            case OP_CMP: {
+                RValue* slotA = &ctx->stack.slots[ctx->stack.top - 2];
+                RValue* slotB = &ctx->stack.slots[ctx->stack.top - 1];
+                uint8_t typeA = slotA->type;
+                uint8_t typeB = slotB->type;
+
+                // Inline numeric fast path
+                bool aNumeric = (typeA == RVALUE_INT32 || typeA == RVALUE_REAL);
+                bool bNumeric = (typeB == RVALUE_INT32 || typeB == RVALUE_REAL);
+                if (aNumeric && bNumeric) {
+                    bool result;
+                    if (typeA == RVALUE_INT32 && typeB == RVALUE_INT32) {
+                        int32_t a = slotA->int32;
+                        int32_t b = slotB->int32;
+                        switch (instrCmpKind(instr)) {
+                            case CMP_LT:  result = b > a;  break;
+                            case CMP_LTE: result = b >= a; break;
+                            case CMP_EQ:  result = a == b; break;
+                            case CMP_NEQ: result = a != b; break;
+                            case CMP_GTE: result = a >= b; break;
+                            case CMP_GT:  result = a > b;  break;
+                            default:      result = false;  break;
+                        }
+                    } else {
+                        GMLReal a = (typeA == RVALUE_REAL) ? slotA->real : (GMLReal) slotA->int32;
+                        GMLReal b = (typeB == RVALUE_REAL) ? slotB->real : (GMLReal) slotB->int32;
+                        switch (instrCmpKind(instr)) {
+                            case CMP_LT:  result = b > a;  break;
+                            case CMP_LTE: result = b >= a; break;
+                            case CMP_EQ:  result = a == b; break;
+                            case CMP_NEQ: result = a != b; break;
+                            case CMP_GTE: result = a >= b; break;
+                            case CMP_GT:  result = a > b;  break;
+                            default:      result = false;  break;
+                        }
+                    }
+                    slotA->int32 = result ? 1 : 0;
+                    slotA->type = RVALUE_BOOL;
+#if IS_BC17_OR_HIGHER_ENABLED
+                    if (IS_BC17_OR_HIGHER(ctx)) slotA->gmlStackType = GML_TYPE_BOOL;
+#endif
+                    ctx->stack.top--;
+                } else {
+                    handleCmp(ctx, instr);
+                }
                 break;
+            }
 
             // Duplicate
             case OP_DUP:
@@ -2591,22 +3079,38 @@ static RValue executeLoop(VMContext* ctx) {
                 break;
 
             // Branches
-            case OP_B:
-                handleBranch(ctx, instr, instrAddr);
+            // The reason why these (the branches opcodes) are inlined is because they access ctx->ip
+            // So, because they are short n' sweet, we prefer to keep them inlined to avoid any reloading shenanigans that the compiler may do
+            case OP_B: {
+                int32_t offset = instrJumpOffset(instr);
+                ip = instrAddr + offset;
                 break;
-            case OP_BT:
-                handleConditionalBranch(ctx, instr, instrAddr, true);
+            }
+            case OP_BT: {
+                bool condition = stackPopInt32(ctx) != 0;
+                if (condition == true) {
+                    int32_t offset = instrJumpOffset(instr);
+                    ip = instrAddr + offset;
+                }
                 break;
-            case OP_BF:
-                handleConditionalBranch(ctx, instr, instrAddr, false);
+            }
+            case OP_BF: {
+                bool condition = stackPopInt32(ctx) != 0;
+                if (condition == false) {
+                    int32_t offset = instrJumpOffset(instr);
+                    ip = instrAddr + offset;
+                }
                 break;
+            }
 
             // Function call
             case OP_CALL:
+                VM_SYNC_IP();
                 handleCall(ctx, instr, extraData);
                 break;
 #if IS_BC17_OR_HIGHER_ENABLED
             case OP_CALLV:
+                VM_SYNC_IP();
                 handleCallV(ctx, instr);
                 break;
 #endif
@@ -2623,10 +3127,14 @@ static RValue executeLoop(VMContext* ctx) {
 
             // Environment (with-statements)
             case OP_PUSHENV:
+                VM_SYNC_IP();
                 handlePushEnv(ctx, instr, instrAddr);
+                VM_RELOAD_IP();
                 break;
             case OP_POPENV:
+                VM_SYNC_IP();
                 handlePopEnv(ctx, instr, instrAddr);
+                VM_RELOAD_IP();
                 break;
 
             // Break (extended opcodes in V17+, no-op/debug in V16)
@@ -2749,16 +3257,16 @@ VMContext* VM_create(DataWin* dataWin) {
     }
 
     // Build funcName -> codeIndex hash map from SCPT chunk
-    ctx->funcMap = nullptr;
+    ctx->codeIndexByName = nullptr;
     forEach(Script, s, dataWin->scpt.scripts, dataWin->scpt.count) {
         if (s->name != nullptr && s->codeId >= 0) {
             if (dataWin->code.count > (uint32_t) s->codeId) {
                 const char* codeName = dataWin->code.entries[s->codeId].name;
                 // Map the full code entry name (e.g. "gml_Script_SCR_GAMESTART")
-                shput(ctx->funcMap, (char*) codeName, s->codeId);
+                shput(ctx->codeIndexByName, (char*) codeName, s->codeId);
                 // Also map the bare script name (e.g. "SCR_GAMESTART")
                 // since the FUNC chunk references use bare names in CALL instructions
-                shput(ctx->funcMap, (char*) s->name, s->codeId);
+                shput(ctx->codeIndexByName, (char*) s->name, s->codeId);
             }
         }
     }
@@ -2766,9 +3274,9 @@ VMContext* VM_create(DataWin* dataWin) {
     // Also map code entry names directly for non-script code (object events, room creation codes, etc.)
     repeat(dataWin->code.count, i) {
         const char* codeName = dataWin->code.entries[i].name;
-        ptrdiff_t existing = shgeti(ctx->funcMap, (char*) codeName);
+        ptrdiff_t existing = shgeti(ctx->codeIndexByName, (char*) codeName);
         if (0 > existing) {
-            shput(ctx->funcMap, (char*) codeName, (int32_t) i);
+            shput(ctx->codeIndexByName, (char*) codeName, (int32_t) i);
         }
     }
 
@@ -2808,12 +3316,12 @@ VMContext* VM_create(DataWin* dataWin) {
         if (builtin != nullptr) {
             ctx->funcCallCache[i].scriptCodeIndex = -1;
         } else {
-            ptrdiff_t mapIdx = shgeti(ctx->funcMap, (char*) name);
-            ctx->funcCallCache[i].scriptCodeIndex = (mapIdx >= 0) ? ctx->funcMap[mapIdx].value : -1;
+            ptrdiff_t mapIdx = shgeti(ctx->codeIndexByName, (char*) name);
+            ctx->funcCallCache[i].scriptCodeIndex = (mapIdx >= 0) ? ctx->codeIndexByName[mapIdx].value : -1;
         }
     }
 
-    fprintf(stderr, "VM: Initialized with %u global vars, sparse self vars (hashmap), %u functions mapped\n", ctx->globalVarCount, (uint32_t) shlen(ctx->funcMap));
+    fprintf(stderr, "VM: Initialized with %u global vars, sparse self vars (hashmap), %u functions mapped\n", ctx->globalVarCount, (uint32_t) shlen(ctx->codeIndexByName));
 
     return ctx;
 }
@@ -2914,11 +3422,11 @@ RValue VM_executeCode(VMContext* ctx, int32_t codeIndex) {
     int32_t savedSavearefBalance = ctx->savearefBalance;
     ctx->savearefBalance = 0;
 
-#ifdef ENABLE_VM_PROFILER
+#ifdef ENABLE_VM_GML_PROFILER
     Profiler_enter(ctx->profiler, code->name);
 #endif
     RValue result = executeLoop(ctx);
-#ifdef ENABLE_VM_PROFILER
+#ifdef ENABLE_VM_GML_PROFILER
     Profiler_exit(ctx->profiler);
 #endif
 
@@ -2986,16 +3494,19 @@ RValue VM_callCodeIndex(VMContext* ctx, int32_t codeIndex, RValue* args, int32_t
     if (argCount > 0 && args != nullptr) {
         repeat(argCount, argIdx) {
             RValue argCopy = args[argIdx];
-            if (argCopy.type == RVALUE_STRING && argCopy.ownsString && argCopy.string != nullptr) {
+            if (argCopy.type == RVALUE_STRING && argCopy.ownsReference && argCopy.string != nullptr) {
                 argCopy.string = safeStrdup(argCopy.string);
             } else if (argCopy.type == RVALUE_ARRAY && argCopy.array != nullptr) {
                 GMLArray_incRef(argCopy.array);
-                argCopy.ownsString = true;
+                argCopy.ownsReference = true;
 #if IS_BC17_OR_HIGHER_ENABLED
             } else if (argCopy.type == RVALUE_METHOD && argCopy.method != nullptr) {
                 GMLMethod_incRef(argCopy.method);
-                argCopy.ownsString = true;
+                argCopy.ownsReference = true;
 #endif
+            } else if (argCopy.type == RVALUE_STRUCT && argCopy.structInst != nullptr) {
+                Instance_structIncRef(argCopy.structInst);
+                argCopy.ownsReference = true;
             }
             ctx->scriptArgs[argIdx] = argCopy;
         }
@@ -3004,11 +3515,11 @@ RValue VM_callCodeIndex(VMContext* ctx, int32_t codeIndex, RValue* args, int32_t
     ctx->savearefBalance = 0;
 
     // Execute the callee
-#ifdef ENABLE_VM_PROFILER
+#ifdef ENABLE_VM_GML_PROFILER
     Profiler_enter(ctx->profiler, code->name);
 #endif
     RValue result = executeLoop(ctx);
-#ifdef ENABLE_VM_PROFILER
+#ifdef ENABLE_VM_GML_PROFILER
     Profiler_exit(ctx->profiler);
 #endif
 
@@ -3016,16 +3527,19 @@ RValue VM_callCodeIndex(VMContext* ctx, int32_t codeIndex, RValue* args, int32_t
 
     // Strengthen result BEFORE freeing callee locals/scriptArgs: if result is a weak view into callee state, the upcoming frees would leave a dangling pointer.
     // For owning results, the refCount/string buffer stays valid (the callee transferred one ownership slot to us).
-    if (result.type == RVALUE_STRING && !result.ownsString && result.string != nullptr) {
+    if (result.type == RVALUE_STRING && !result.ownsReference && result.string != nullptr) {
         result = RValue_makeOwnedString(safeStrdup(result.string));
-    } else if (result.type == RVALUE_ARRAY && !result.ownsString && result.array != nullptr) {
+    } else if (result.type == RVALUE_ARRAY && !result.ownsReference && result.array != nullptr) {
         GMLArray_incRef(result.array);
-        result.ownsString = true;
+        result.ownsReference = true;
 #if IS_BC17_OR_HIGHER_ENABLED
-    } else if (result.type == RVALUE_METHOD && !result.ownsString && result.method != nullptr) {
+    } else if (result.type == RVALUE_METHOD && !result.ownsReference && result.method != nullptr) {
         GMLMethod_incRef(result.method);
-        result.ownsString = true;
+        result.ownsReference = true;
 #endif
+    } else if (result.type == RVALUE_STRUCT && !result.ownsReference && result.structInst != nullptr) {
+        Instance_structIncRef(result.structInst);
+        result.ownsReference = true;
     }
 
     // Restore caller frame
@@ -3474,9 +3988,9 @@ void VM_buildCrossReferences(VMContext* ctx) {
                 uint32_t funcIdx = resolveFuncOperand(ed);
                 if (dw->func.functionCount > funcIdx) {
                     const char* funcName = dw->func.functions[funcIdx].name;
-                    ptrdiff_t codeMapIdx = shgeti(ctx->funcMap, (char*) funcName);
+                    ptrdiff_t codeMapIdx = shgeti(ctx->codeIndexByName, (char*) funcName);
                     if (codeMapIdx >= 0) {
-                        int32_t targetIdx = ctx->funcMap[codeMapIdx].value;
+                        int32_t targetIdx = ctx->codeIndexByName[codeMapIdx].value;
                         ptrdiff_t mapIdx = hmgeti(ctx->crossRefMap, targetIdx);
                         if (0 > mapIdx) {
                             int32_t* callers = nullptr;
@@ -3631,11 +4145,18 @@ void VM_free(VMContext* ctx) {
     Profiler_destroy(ctx->profiler);
     ctx->profiler = nullptr;
 
+#ifdef ENABLE_VM_OPCODE_PROFILER
+    free(ctx->opcodeVariantCounts);
+    ctx->opcodeVariantCounts = nullptr;
+    free(ctx->opcodeRValueTypeCounts);
+    ctx->opcodeRValueTypeCounts = nullptr;
+#endif
+
     // Free global vars array itself
     free(ctx->globalVars);
 
     // Free hash maps
-    shfree(ctx->funcMap);
+    shfree(ctx->codeIndexByName);
     shfree(ctx->globalVarNameMap);
     shfree(ctx->selfVarNameMap);
     repeat(shlen(ctx->codeLocalsMap), i) {

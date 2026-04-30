@@ -46,10 +46,14 @@ target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(butterscotch PUBLIC vendor/stb/ds)
 
 if(PLATFORM STREQUAL "glfw")
+    file(GLOB GL_SOURCES src/gl/*.c)
+    target_sources(butterscotch PRIVATE ${GL_SOURCES})
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/gl)
+
     # Butterscotch VM/interpreter profiler
-    option(ENABLE_VM_PROFILER "Enable Butterscotch VM/interpreter profiler" ON)
-    if(ENABLE_VM_PROFILER)
-        add_compile_definitions(ENABLE_VM_PROFILER)
+    option(ENABLE_VM_GML_PROFILER "Enable Butterscotch VM/interpreter profiler" ON)
+    if(ENABLE_VM_GML_PROFILER)
+        add_compile_definitions(ENABLE_VM_GML_PROFILER)
     endif()
 
     # Butterscotch VM/interpreter tracing
@@ -58,8 +62,14 @@ if(PLATFORM STREQUAL "glfw")
         add_compile_definitions(ENABLE_VM_TRACING)
     endif()
 
+    # Butterscotch VM opcode count profiler
+    option(ENABLE_VM_OPCODE_PROFILER "Enable Butterscotch VM opcode count profiler" ON)
+    if(ENABLE_VM_OPCODE_PROFILER)
+        add_compile_definitions(ENABLE_VM_OPCODE_PROFILER)
+    endif()
+
     # Spatial grid logs
-    option(ENABLE_SPATIAL_GRID_LOGS "Enable Spatial Grid logs" ON)
+    option(ENABLE_SPATIAL_GRID_LOGS "Enable Spatial Grid logs" OFF)
     if(ENABLE_SPATIAL_GRID_LOGS)
         add_compile_definitions(ENABLE_SPATIAL_GRID_LOGS)
     endif()
@@ -131,15 +141,21 @@ elseif(PLATFORM STREQUAL "ps2")
     add_compile_definitions(NO_RVALUE_INT64)
 
     # Butterscotch VM/interpreter profiler
-    option(ENABLE_VM_PROFILER "Enable Butterscotch VM/interpreter profiler" OFF)
-    if(ENABLE_VM_PROFILER)
-        add_compile_definitions(ENABLE_VM_PROFILER)
+    option(ENABLE_VM_GML_PROFILER "Enable Butterscotch VM/interpreter profiler" OFF)
+    if(ENABLE_VM_GML_PROFILER)
+        add_compile_definitions(ENABLE_VM_GML_PROFILER)
     endif()
 
     # Butterscotch VM/interpreter tracing
     option(ENABLE_VM_TRACING "Enable Butterscotch VM/interpreter tracing checks" OFF)
     if(ENABLE_VM_TRACING)
         add_compile_definitions(ENABLE_VM_TRACING)
+    endif()
+
+    # Butterscotch VM opcode count profiler
+    option(ENABLE_VM_OPCODE_PROFILER "Enable Butterscotch VM opcode count profiler" OFF)
+    if(ENABLE_VM_OPCODE_PROFILER)
+        add_compile_definitions(ENABLE_VM_OPCODE_PROFILER)
     endif()
 
     # Spatial grid logs

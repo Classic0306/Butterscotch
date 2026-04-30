@@ -16,6 +16,12 @@ typedef struct GMLArray GMLArray;
 void GMLArray_decRef(struct GMLArray* arr);
 void GMLArray_incRef(struct GMLArray* arr);
 
+struct Instance;
+typedef struct Instance Instance;
+void Instance_structIncRef(struct Instance* inst);
+void Instance_structDecRef(struct Instance* inst);
+uint32_t Instance_getInstanceId(struct Instance* inst);
+
 #include "gml_method.h"
 
 // ===[ GML Data Types (4-bit type codes) ]===
@@ -38,6 +44,7 @@ typedef enum {
     RVALUE_UNDEFINED = 5,
     RVALUE_ARRAY = 6,
     RVALUE_METHOD = 7,
+    RVALUE_STRUCT = 8,
 } RValueType;
 
 typedef struct RValue {
@@ -52,13 +59,14 @@ typedef struct RValue {
 #if IS_BC17_OR_HIGHER_ENABLED
         GMLMethod* method;
 #endif
+        Instance* structInst;
     };
     // We use uint8_t for the type instead of RValueType because a enum value occupies 4 bytes, while uint8_t occupies 1 byte
     uint8_t type;
     // For RVALUE_STRING: true = the `string` buffer is owned and must be freed on RValue_free.
-    // For RVALUE_ARRAY: true = this RValue holds one strong ref and must decRef on RValue_free.
+    // For RVALUE_ARRAY, RVALUE_METHOD, RVALUE_STRUCT: true = this RValue holds one strong ref and must decRef on RValue_free.
     // Non-owning ("weak") RValues are short-lived views returned by getters, caller must NOT free them.
-    bool ownsString;
+    bool ownsReference;
 #if IS_BC17_OR_HIGHER_ENABLED
     uint8_t gmlStackType; // GML data type from the instruction that pushed this value
 #endif
@@ -98,11 +106,11 @@ static RValue RValue_makeBool(bool val) {
 }
 
 static RValue RValue_makeString(const char* val) {
-    return (RValue){ .string = val, .type = RVALUE_STRING, .ownsString = false, RVALUE_INIT_GMLTYPE(GML_TYPE_STRING) };
+    return (RValue){ .string = val, .type = RVALUE_STRING, .ownsReference = false, RVALUE_INIT_GMLTYPE(GML_TYPE_STRING) };
 }
 
 static RValue RValue_makeOwnedString(char* val) {
-    return (RValue){ .string = val, .type = RVALUE_STRING, .ownsString = true, RVALUE_INIT_GMLTYPE(GML_TYPE_STRING) };
+    return (RValue){ .string = val, .type = RVALUE_STRING, .ownsReference = true, RVALUE_INIT_GMLTYPE(GML_TYPE_STRING) };
 }
 
 static RValue RValue_makeUndefined(void) {
@@ -112,25 +120,65 @@ static RValue RValue_makeUndefined(void) {
 // Takes ownership: refCount is NOT bumped (caller hands off its ref). The returned RValue decRefs on free.
 // Use this when you have a freshly-allocated array (GMLArray_alloc) or after a GMLArray_incRef.
 static RValue RValue_makeArray(GMLArray* arr) {
-    return (RValue){ .array = arr, .type = RVALUE_ARRAY, .ownsString = true, RVALUE_INIT_GMLTYPE(GML_TYPE_VARIABLE) };
+    return (RValue){ .array = arr, .type = RVALUE_ARRAY, .ownsReference = true, RVALUE_INIT_GMLTYPE(GML_TYPE_VARIABLE) };
 }
 
 // Weak view: does not own (no decRef on free). Callers that stash the value long-term must incRef + set ownsString.
 static RValue RValue_makeArrayWeak(GMLArray* arr) {
-    return (RValue){ .array = arr, .type = RVALUE_ARRAY, .ownsString = false, RVALUE_INIT_GMLTYPE(GML_TYPE_VARIABLE) };
+    return (RValue){ .array = arr, .type = RVALUE_ARRAY, .ownsReference = false, RVALUE_INIT_GMLTYPE(GML_TYPE_VARIABLE) };
 }
 
 #if IS_BC17_OR_HIGHER_ENABLED
 // Takes ownership: refCount is NOT bumped (caller hands off its ref). The returned RValue decRefs on free.
 static RValue RValue_makeMethod(int32_t codeIndex, int32_t boundInstanceId) {
-    return (RValue){ .method = GMLMethod_create(codeIndex, boundInstanceId), .type = RVALUE_METHOD, .ownsString = true, .gmlStackType = GML_TYPE_VARIABLE };
+    return (RValue){ .method = GMLMethod_create(codeIndex, boundInstanceId), .type = RVALUE_METHOD, .ownsReference = true, .gmlStackType = GML_TYPE_VARIABLE };
 }
 
 // Weak view: does not own (no decRef on free). Callers that stash the value long-term must incRef + set ownsString.
 static RValue RValue_makeMethodWeak(GMLMethod* m) {
-    return (RValue){ .method = m, .type = RVALUE_METHOD, .ownsString = false, .gmlStackType = GML_TYPE_VARIABLE };
+    return (RValue){ .method = m, .type = RVALUE_METHOD, .ownsReference = false, .gmlStackType = GML_TYPE_VARIABLE };
 }
 #endif
+
+// Takes ownership: refCount is NOT bumped (caller hands off its ref). The returned RValue decRefs on free.
+// Use this for the freshly-allocated struct returned by @@NewGMLObject@@, after the caller has already accounted for both the registry's implicit ref and the returned-RValue ref.
+static RValue RValue_makeStruct(Instance* inst) {
+    return (RValue){ .structInst = inst, .type = RVALUE_STRUCT, .ownsReference = true, RVALUE_INIT_GMLTYPE(GML_TYPE_VARIABLE) };
+}
+
+// Weak view: does not own (no decRef on free). Callers that stash the value long-term must incRef + set ownsString.
+static RValue RValue_makeStructWeak(Instance* inst) {
+    return (RValue){ .structInst = inst, .type = RVALUE_STRUCT, .ownsReference = false, RVALUE_INIT_GMLTYPE(GML_TYPE_VARIABLE) };
+}
+
+// Makes "val" independent, that is...
+// * For strings, it creates an owned copy of it (copying the original string underneath)
+// * For arrays/methods/structs, it increments the reference count
+// * For anything else, it does nothing because they don't need to be made independent
+//
+// Useful to store arbitrary RValues in containers (ds_map, ds_list, etc.)
+// The caller's original RValue is unaffected and must still be freed normally.
+static RValue RValue_makeIndependent(RValue val) {
+    if (val.type == RVALUE_STRING && val.string != nullptr) {
+        return RValue_makeOwnedString(safeStrdup(val.string));
+    } else if (val.type == RVALUE_ARRAY && val.array != nullptr) {
+        GMLArray_incRef(val.array);
+        val.ownsReference = true;
+        return val;
+#if IS_BC17_OR_HIGHER_ENABLED
+    } else if (val.type == RVALUE_METHOD && val.method != nullptr) {
+        GMLMethod_incRef(val.method);
+        val.ownsReference = true;
+        return val;
+#endif
+    } else if (val.type == RVALUE_STRUCT && val.structInst != nullptr) {
+        Instance_structIncRef(val.structInst);
+        val.ownsReference = true;
+        return val;
+    }
+    requireMessageFormatted(!val.ownsReference, "Trying to make independent a RValue (type=%d) that owns a reference, but we don't handle it yet! Did you add a new refcounted value to Butterscotch without implementing RValue_makeIndependent for it?", val.type);
+    return val;
+}
 
 // Converts an RValue to a heap-allocated string representation.
 // The caller must free the returned string
@@ -162,6 +210,9 @@ static char* RValue_toString(RValue val) {
             snprintf(buf, sizeof(buf), "<method:%d>", val.method->codeIndex);
             return safeStrdup(buf);
 #endif
+        case RVALUE_STRUCT:
+            snprintf(buf, sizeof(buf), "<struct:%u>", val.structInst != nullptr ? Instance_getInstanceId(val.structInst) : 0);
+            return safeStrdup(buf);
     }
     return safeStrdup("");
 }
@@ -224,25 +275,32 @@ static char* RValue_toStringTyped(RValue val) {
             snprintf(buf, sizeof(buf), "method(code=%d, inst=%d)", val.method->codeIndex, val.method->boundInstanceId);
             return safeStrdup(buf);
 #endif
+        case RVALUE_STRUCT:
+            snprintf(buf, sizeof(buf), "struct(id=%u)", val.structInst != nullptr ? Instance_getInstanceId(val.structInst) : 0);
+            return safeStrdup(buf);
     }
     return safeStrdup("???");
 }
 
 static void RValue_free(RValue* val) {
-    if (val->type == RVALUE_STRING && val->ownsString && val->string != nullptr) {
+    if (val->type == RVALUE_STRING && val->ownsReference && val->string != nullptr) {
         free((void*) val->string);
         val->string = nullptr;
-        val->ownsString = false;
-    } else if (val->type == RVALUE_ARRAY && val->ownsString && val->array != nullptr) {
+        val->ownsReference = false;
+    } else if (val->type == RVALUE_ARRAY && val->ownsReference && val->array != nullptr) {
         GMLArray_decRef(val->array);
         val->array = nullptr;
-        val->ownsString = false;
+        val->ownsReference = false;
 #if IS_BC17_OR_HIGHER_ENABLED
-    } else if (val->type == RVALUE_METHOD && val->ownsString && val->method != nullptr) {
+    } else if (val->type == RVALUE_METHOD && val->ownsReference && val->method != nullptr) {
         GMLMethod_decRef(val->method);
         val->method = nullptr;
-        val->ownsString = false;
+        val->ownsReference = false;
 #endif
+    } else if (val->type == RVALUE_STRUCT && val->ownsReference && val->structInst != nullptr) {
+        Instance_structDecRef(val->structInst);
+        val->structInst = nullptr;
+        val->ownsReference = false;
     }
 }
 
@@ -259,6 +317,7 @@ static GMLReal RValue_toReal(RValue val) {
 #if IS_BC17_OR_HIGHER_ENABLED
         case RVALUE_METHOD: return 0.0;
 #endif
+        case RVALUE_STRUCT: return val.structInst != nullptr ? (GMLReal) Instance_getInstanceId(val.structInst) : 0.0;
         default:            return 0.0;
     }
 }
@@ -276,6 +335,7 @@ static int32_t RValue_toInt32(RValue val) {
 #if IS_BC17_OR_HIGHER_ENABLED
         case RVALUE_METHOD: return 0;
 #endif
+        case RVALUE_STRUCT: return val.structInst != nullptr ? (int32_t) Instance_getInstanceId(val.structInst) : 0;
         default:            return 0;
     }
 }
@@ -293,6 +353,7 @@ static int64_t RValue_toInt64(RValue val) {
 #if IS_BC17_OR_HIGHER_ENABLED
         case RVALUE_METHOD: return 0;
 #endif
+        case RVALUE_STRUCT: return val.structInst != nullptr ? (int64_t) Instance_getInstanceId(val.structInst) : 0;
         default:            return 0;
     }
 }
@@ -310,6 +371,7 @@ static bool RValue_toBool(RValue val) {
 #if IS_BC17_OR_HIGHER_ENABLED
         case RVALUE_METHOD: return true;
 #endif
+        case RVALUE_STRUCT: return val.structInst != nullptr;
         default:            return false;
     }
 }

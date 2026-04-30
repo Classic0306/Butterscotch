@@ -99,12 +99,13 @@ void GamePath_computeInternal(GamePath* path) {
     tempIntPoints = nullptr;
     tempIntPointCount = 0;
 
-    if (path->pointCount == 0) {
-        path->internalPointCount = 0;
-        path->internalPoints = nullptr;
-        path->length = 0.0;
+    free(path->internalPoints);
+    path->internalPoints = nullptr;
+    path->internalPointCount = 0;
+    path->length = 0.0;
+
+    if (path->pointCount == 0)
         return;
-    }
 
     if (path->isSmooth) {
         // ComputeCurved (yyPath.js:254-292)
@@ -483,7 +484,7 @@ static void parseSPRT(BinaryReader* reader, DataWin* dw, bool skipLoadingPrecise
 
     if (count == 0) { free(ptrs); s->sprites = nullptr; return; }
 
-    s->sprites = safeMalloc(count * sizeof(Sprite));
+    s->sprites = safeCalloc(count, sizeof(Sprite));
     repeat(count, i) {
         BinaryReader_seek(reader, ptrs[i]);
         Sprite* spr = &s->sprites[i];
@@ -504,6 +505,7 @@ static void parseSPRT(BinaryReader* reader, DataWin* dw, bool skipLoadingPrecise
 
         // Detect special type vs normal: peek next int32
         int32_t check = BinaryReader_readInt32(reader);
+        uint32_t nineSliceOffset = 0;
         if (check == -1) {
             spr->specialType = true;
             spr->sVersion = BinaryReader_readUint32(reader);
@@ -514,7 +516,7 @@ static void parseSPRT(BinaryReader* reader, DataWin* dw, bool skipLoadingPrecise
                 if (spr->sVersion >= 2) {
                     BinaryReader_skip(reader, 4); //sequenceOffset;
                     if (spr->sVersion >= 3) {
-                       BinaryReader_skip(reader, 4); // nineSliceOffset;
+                       nineSliceOffset = BinaryReader_readUint32(reader);
                     }
                 }
                 check = BinaryReader_readUint32(reader);
@@ -565,8 +567,24 @@ static void parseSPRT(BinaryReader* reader, DataWin* dw, bool skipLoadingPrecise
         } else {
             spr->masks = nullptr;
         }
+
+        // Nine-slice block (40 bytes). Located at nineSliceOffset (absolute file offset) elsewhere in the chunk.
+        if (nineSliceOffset != 0) {
+            size_t savedPos = BinaryReader_getPosition(reader);
+            BinaryReader_seek(reader, (size_t) nineSliceOffset);
+            spr->nsLeft = BinaryReader_readInt32(reader);
+            spr->nsTop = BinaryReader_readInt32(reader);
+            spr->nsRight = BinaryReader_readInt32(reader);
+            spr->nsBottom = BinaryReader_readInt32(reader);
+            spr->nineSliceEnabled = BinaryReader_readBool32(reader);
+            repeat(5, j) {
+                int32_t mode = BinaryReader_readInt32(reader);
+                spr->nsTileModes[j] = (uint8_t) mode;
+            }
+            BinaryReader_seek(reader, savedPos);
+        }
     }
-    
+
     free(ptrs);
 }
 
@@ -627,6 +645,9 @@ static void parsePATH(BinaryReader* reader, DataWin* dw) {
     repeat(count, i) {
         BinaryReader_seek(reader, ptrs[i]);
         GamePath* path = &p->paths[i];
+        path->internalPoints = nullptr;
+        path->internalPointCount = 0;
+        path->length = 0.0;
         path->name = readStringPtr(reader, dw);
         path->isSmooth = BinaryReader_readBool32(reader);
         path->isClosed = BinaryReader_readBool32(reader);
