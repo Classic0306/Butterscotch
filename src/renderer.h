@@ -66,12 +66,12 @@ typedef struct {
     void (*flush)(Renderer* renderer);
     int32_t (*createSpriteFromSurface)(Renderer* renderer, int32_t surfaceID, int32_t x, int32_t y, int32_t w, int32_t h, bool removeback, bool smooth, int32_t xorig, int32_t yorig);
     void (*deleteSprite)(Renderer* renderer, int32_t spriteIndex);
-    void (*gpuSetBlendMode)(Renderer* renderer, int32_t mode);
-    void (*gpuSetBlendModeExt)(Renderer* renderer, int32_t sfactor, int32_t dfactor);
-    void (*gpuSetBlendEnable)(Renderer* renderer, bool enable);
-    void (*gpuSetAlphaTestEnable)(Renderer* renderer, bool enable);
-    void (*gpuSetAlphaTestRef)(Renderer* renderer, uint8_t ref);
-    void (*gpuSetColorWriteEnable)(Renderer* renderer, bool red, bool green, bool blue, bool alpha);
+    //void (*gpuSetBlendMode)(Renderer* renderer, int32_t mode);
+    //void (*gpuSetBlendModeExt)(Renderer* renderer, int32_t sfactor, int32_t dfactor);
+    //void (*gpuSetBlendEnable)(Renderer* renderer, bool enable);
+    //void (*gpuSetAlphaTestEnable)(Renderer* renderer, bool enable);
+    //void (*gpuSetAlphaTestRef)(Renderer* renderer, uint8_t ref);
+    //void (*gpuSetColorWriteEnable)(Renderer* renderer, bool red, bool green, bool blue, bool alpha);
     // Optional: platform-specific tile rendering (nullptr = use default drawSpritePart path)
     void (*drawTile)(Renderer* renderer, RoomTile* tile, float offsetX, float offsetY);
     // Optional: platform-specific tiled draw (nullptr = use default per-tile drawSprite loop).
@@ -94,12 +94,12 @@ typedef struct {
     void (*surfaceFree)(Renderer* renderer, int32_t surfaceID);
 
     // GPU Functions
-    //void (*gpuSetBlendmode)(Renderer* renderer, int32_t BlendMode);
-    //void (*gpuSetBlendmodeExt)(Renderer* renderer, int32_t src, int32_t dest);
-    //void (*gpuSetColorWriteEnable)(Renderer* renderer, bool r, bool g, bool b, bool a);
-    //void (*gpuSetBlendenable)(Renderer* renderer, bool enabled);
-    //void (*gpuSetAlphablendref)(Renderer* renderer, int32_t alpharef);
-    //bool (*gpuGetBlendenabled)(Renderer* renderer); 
+    void (*gpuSetBlendmode)(Renderer* renderer, int32_t BlendMode);
+    void (*gpuSetBlendmodeExt)(Renderer* renderer, int32_t src, int32_t dest);
+    void (*gpuSetColorWriteEnable)(Renderer* renderer, bool r, bool g, bool b, bool a);
+    void (*gpuSetBlendenable)(Renderer* renderer, bool enabled);
+    void (*gpuSetAlphablendref)(Renderer* renderer, int32_t alpharef);
+    bool (*gpuGetBlendenabled)(Renderer* renderer); 
 } RendererVtable; //gpu_set_colorwriteenable
 
 // ===[ Renderer Base Struct ]===

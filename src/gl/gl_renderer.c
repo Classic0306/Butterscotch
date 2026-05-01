@@ -38,7 +38,6 @@ static const char* fragmentShaderSource =
     "#version 410 core\n"
     "in vec2 vTexCoord;\n"
     "in vec4 vColor;\n"
-    "uniform float uAlphaRef;\n"
     "uniform sampler2D uTexture;\n"
     "uniform float uAlphaTestRef;\n" // negative = disabled
     "out vec4 fragColor;\n"
@@ -2001,7 +2000,7 @@ static void glSetBlendAlphaRef(Renderer* renderer, int32_t alpharef) {
     flushBatch(gl);
     float alpha = (float) alpharef / 255.0f;
     gl->base.alphaCutRef = alpha;
-    glUniform1f(gl->uAlphaRef, alpha);
+    glUniform1f(gl->uAlphaTestRef, alpha);
 }
 
 
@@ -2293,12 +2292,12 @@ static RendererVtable glVtable = {
     .flush = glRendererFlush,
     .createSpriteFromSurface = glCreateSpriteFromSurface,
     .deleteSprite = glDeleteSprite,
-    .gpuSetBlendMode = glGpuSetBlendMode,
-    .gpuSetBlendModeExt = glGpuSetBlendModeExt,
-    .gpuSetBlendEnable = glGpuSetBlendEnable,
-    .gpuSetAlphaTestEnable = glGpuSetAlphaTestEnable,
-    .gpuSetAlphaTestRef = glGpuSetAlphaTestRef,
-    .gpuSetColorWriteEnable = glGpuSetColorWriteEnable,
+    //.gpuSetBlendMode = glGpuSetBlendMode,
+    //.gpuSetBlendModeExt = glGpuSetBlendModeExt,
+    //.gpuSetBlendEnable = glGpuSetBlendEnable,
+    //.gpuSetAlphaTestEnable = glGpuSetAlphaTestEnable,
+    //.gpuSetAlphaTestRef = glGpuSetAlphaTestRef,
+    //.gpuSetColorWriteEnable = glGpuSetColorWriteEnable,
     .drawTile = nullptr,
     .createSurface = glCreateSurface,
     .surfaceExists = glSurfaceExists,
